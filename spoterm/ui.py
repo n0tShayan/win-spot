@@ -4,13 +4,22 @@ import curses
 import unicodedata
 from functools import lru_cache
 
-# Colour pair ids
-TEXT, DIM, FAINT, ACCENT, SEL, SEL_ACCENT, SEL_DIM, WARN, TITLE = range(1, 10)
+# Colour roles (pair ids)
+TEXT, DIM, FAINT, ACCENT, SEL, SEL_ACCENT, SEL_DIM, WARN, TITLE, MUTED, MARK = range(1, 12)
+
+# Palette for 256-colour terminals, and the exact colours used where 24-bit colour is safe.
+XTERM = {"text": 252, "dim": 246, "faint": 240, "accent": 41, "band": 236, "white": 255,
+         "sel_dim": 249, "warn": 209, "muted": 65}
+RGB = {"text": 0xD4D4D4, "dim": 0x9E9E9E, "faint": 0x5A5A5A, "accent": 0x1DB954, "band": 0x2A2A2A,
+       "white": 0xFFFFFF, "sel_dim": 0xB3B3B3, "warn": 0xF0925A, "muted": 0x4B8A61}
 
 
 class Theme:
+    """Colour roles: text in three strengths, one green accent, a selection band and a warning."""
+
     def __init__(self):
         self.attr = {}
+        self.truecolor = False
 
     def init(self) -> None:
         try:
@@ -20,24 +29,42 @@ class Theme:
         except curses.error:
             bg = curses.COLOR_BLACK
 
-        if curses.has_colors() and curses.COLORS >= 256:
+        extra = {}
+        n = curses.COLORS if curses.has_colors() else 0
+        if n >= 256:
+            c = dict(XTERM)
+            # PDCurses (Windows Terminal) emits colours past 256 as 24-bit SGR and leaves the
+            # terminal's palette alone. ncurses would rewrite the palette itself, so stay off it.
+            if n > 256 and curses.can_change_color():
+                try:
+                    for i, (name, v) in enumerate(RGB.items()):
+                        curses.init_color(256 + i, *((v >> sh & 255) * 1000 // 255 for sh in (16, 8, 0)))
+                        c[name] = 256 + i
+                    self.truecolor = True
+                except curses.error:
+                    c = dict(XTERM)
+            band = c["band"]
             pairs = {
-                TEXT: (252, bg), DIM: (244, bg), FAINT: (238, bg), ACCENT: (41, bg),
-                SEL: (255, 236), SEL_ACCENT: (41, 236), SEL_DIM: (247, 236),
-                WARN: (209, bg), TITLE: (255, bg),
+                TEXT: (c["text"], bg), DIM: (c["dim"], bg), FAINT: (c["faint"], bg),
+                ACCENT: (c["accent"], bg), SEL: (c["white"], band), SEL_ACCENT: (c["accent"], band),
+                SEL_DIM: (c["sel_dim"], band), WARN: (c["warn"], bg), TITLE: (c["white"], bg),
+                MUTED: (c["muted"], bg), MARK: (c["accent"], band),
             }
-            extra = {DIM: 0, FAINT: 0}
-        elif curses.has_colors():
+        elif n >= 8:
             W, G, K, Y = curses.COLOR_WHITE, curses.COLOR_GREEN, curses.COLOR_BLACK, curses.COLOR_YELLOW
+            faint = 8 if n >= 16 else W   # bright black is a real grey when it exists
             pairs = {
-                TEXT: (W, bg), DIM: (W, bg), FAINT: (W, bg), ACCENT: (G, bg),
-                SEL: (K, W), SEL_ACCENT: (K, G), SEL_DIM: (K, W), WARN: (Y, bg), TITLE: (W, bg),
+                TEXT: (W, bg), DIM: (W, bg), FAINT: (faint, bg), ACCENT: (G, bg),
+                SEL: (K, W), SEL_ACCENT: (K, W), SEL_DIM: (K, W), WARN: (Y, bg), TITLE: (W, bg),
+                MUTED: (W, bg), MARK: (G, W),
             }
-            extra = {DIM: curses.A_DIM, FAINT: curses.A_DIM}
+            extra = {DIM: curses.A_DIM, MUTED: curses.A_DIM, SEL_ACCENT: curses.A_BOLD}
+            if n < 16:
+                extra[FAINT] = curses.A_DIM
         else:
-            self.attr = {TEXT: 0, DIM: curses.A_DIM, FAINT: curses.A_DIM, ACCENT: curses.A_BOLD,
-                         SEL: curses.A_REVERSE, SEL_ACCENT: curses.A_REVERSE | curses.A_BOLD,
-                         SEL_DIM: curses.A_REVERSE, WARN: curses.A_BOLD, TITLE: curses.A_BOLD}
+            R, B, D = curses.A_REVERSE, curses.A_BOLD, curses.A_DIM
+            self.attr = {TEXT: 0, DIM: D, FAINT: D, ACCENT: B, SEL: R, SEL_ACCENT: R | B,
+                         SEL_DIM: R, WARN: B, TITLE: B, MUTED: D, MARK: R | B}
             return
 
         for pid, (fg, bgc) in pairs.items():
@@ -52,14 +79,17 @@ class Theme:
         return self.attr.get(pid, 0)
 
 
+# Everything here renders single-width in Windows Terminal / Cascadia (no emoji presentation).
 UNICODE_GLYPHS = {
     "play": "▶", "pause": "‖", "heart": "♥", "bar_on": "━", "bar_off": "─",
-    "rule": "─", "dot": "●", "ell": "…", "sep": " · ", "cursor": "›",
+    "rule": "─", "dot": "●", "ell": "…", "sep": " · ", "cursor": "›", "mark": "▌",
+    "thumb": "┃", "ramp": "▁▂▃▄▅▆▇█",
     "tl": "╭", "tr": "╮", "bl": "╰", "br": "╯", "h": "─", "v": "│",
 }
 ASCII_GLYPHS = {
     "play": ">", "pause": "=", "heart": "<3", "bar_on": "=", "bar_off": "-",
-    "rule": "-", "dot": "*", "ell": "~", "sep": " - ", "cursor": ">",
+    "rule": "-", "dot": "*", "ell": "~", "sep": " - ", "cursor": ">", "mark": ">",
+    "thumb": "|", "ramp": "",
     "tl": "+", "tr": "+", "bl": "+", "br": "+", "h": "-", "v": "|",
 }
 

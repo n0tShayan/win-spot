@@ -17,6 +17,7 @@ import queue
 import sys
 import time
 from dataclasses import dataclass, field
+from typing import NamedTuple
 
 try:
     import curses
@@ -24,9 +25,10 @@ except ImportError:
     sys.exit("curses is missing. On Windows run:  pip install windows-curses")
 
 from . import api, config
+from .engine import Engine
 from .api import Playback, Track, describe_error
 from .worker import Worker
-from .ui import (ACCENT, DIM, FAINT, SEL, SEL_ACCENT, SEL_DIM, TEXT, TITLE, WARN,
+from .ui import (ACCENT, DIM, FAINT, MARK, MUTED, SEL, SEL_ACCENT, SEL_DIM, TEXT, TITLE, WARN,
                  ASCII_GLYPHS, UNICODE_GLYPHS, Theme, fit, fmt_time, put, width)
 
 POLL_PLAYING = 5.0     # seconds between polls while playing
@@ -87,20 +89,52 @@ class SideItem:
 
 
 HELP = (
-    ("space / p", "play / pause"),
-    ("n / b", "next / previous track"),
-    (", / .", "seek back / forward 10s"),
-    ("- / +", "volume down / up"),
-    ("s / r", "shuffle / repeat"),
-    ("f", "like / unlike current track"),
-    ("d", "choose playback device"),
-    ("/", "search"),
-    ("enter", "open list / play track"),
-    ("tab  h  l", "move between panes"),
-    ("j k  g G", "down, up, top, bottom"),
-    ("R", "refresh"),
-    ("q", "quit"),
+    ("Playback", (
+        ("space p", "play / pause"),
+        ("n  b", "next / previous"),
+        (",  .", "seek 10s"),
+        ("-  +", "volume"),
+        ("s  r", "shuffle / repeat"),
+        ("f", "like track"),
+        ("d", "devices"),
+    )),
+    ("Browse", (
+        ("/", "search"),
+        ("enter", "open / play"),
+        ("tab h l", "switch pane"),
+        ("j  k", "down / up"),
+        ("g  G", "top / bottom"),
+        ("R", "refresh"),
+        ("q", "quit"),
+    )),
 )
+
+
+@dataclass(frozen=True)
+class Layout:
+    """Screen geometry for one terminal size (see App.layout)."""
+    side_w: int     # sidebar text width; its rows span columns 1 .. side_w + 2
+    top: int        # first body row (the list title)
+    h: int          # body height
+    x0: int         # main pane text column (the selection marker sits at x0 - 1)
+    w: int          # main pane text width (then one pad column and the scrollbar)
+    head_y: int     # column header row
+    list_y: int     # first track row
+    rows: int       # visible track rows
+    rule_y: int     # player rule; title, artist and progress rows follow it
+
+
+class Cols(NamedTuple):
+    """Track-list column widths for one list and pane width (see App.columns)."""
+    num_w: int
+    title_w: int
+    artist_w: int
+    album_w: int
+    dur_w: int
+    head: str       # the column header row, pre-rendered
+
+
+_UNSET = object()   # "never drawn", distinct from any row key
 
 
 def _scroll(sel: int, top: int, h: int, n: int) -> int:
@@ -114,9 +148,14 @@ def _scroll(sel: int, top: int, h: int, n: int) -> int:
 
 
 class App:
-    def __init__(self, scr, spotify: api.Spotify, settings: config.Settings):
+    def __init__(self, scr, spotify: api.Spotify, settings: config.Settings,
+                 engine: Engine | None = None):
         self.scr = scr
         self.api = spotify
+        self.engine = engine
+        # SpoTerm's own player: "" (no engine), "off", "not installed", "login needed",
+        # "starting", "ready", "stopped" or "exited (N)". Refreshed by timers().
+        self.engine_status = engine.status if engine else ""
         self.g = ASCII_GLYPHS if settings.ascii else UNICODE_GLYPHS
         self.theme = Theme()
 
@@ -209,6 +248,7 @@ class App:
     def on_playback(self, pb: Playback | None) -> None:
         self.poll_inflight = False
         now = time.monotonic()
+        self.next_poll = now + POLL_ERROR   # never left at inf if the rest of this raises
         if pb and self.vol_target is not None:
             pb.volume = self.vol_target
         self.pb = pb
@@ -233,8 +273,10 @@ class App:
 
     def on_poll_error(self, err: BaseException) -> None:
         self.poll_inflight = False
+        # Honour a long 429 Retry-After (net.py only waits out short ones itself).
+        wait = min(max(POLL_ERROR, getattr(err, "retry_after", 0) or 0), 300.0)
+        self.next_poll = time.monotonic() + wait
         self.flash(describe_error(err), warn=True)
-        self.next_poll = time.monotonic() + POLL_ERROR
 
     def _set_liked(self, uri: str, value: bool) -> None:
         if uri == self.liked_uri:
@@ -278,7 +320,8 @@ class App:
 
     def change_volume(self, delta: int) -> None:
         pb = self.pb
-        base = self.vol_target if self.vol_target is not None else (pb.volume if pb else None)
+        # pb may be gone (a poll found nothing playing) while a volume request is still pending.
+        base = (self.vol_target if self.vol_target is not None else pb.volume) if pb else None
         if base is None:
             self.flash("Volume can't be changed on this device" if pb else "Nothing is playing", warn=True)
             return
@@ -361,6 +404,8 @@ class App:
             self.pb.track, self.pb.progress_ms, self.pb.fetched_at, self.pb.is_playing = t, 0, now, True
         else:
             self.pb = Playback(t, True, 0, now, None, "", None, False, "off", None)
+        if not self.pb.device_id and self.engine_status == "starting":
+            self.flash("Starting the SpoTerm player…")
         self.command(fn)
         self.dirty = True
 
@@ -503,7 +548,7 @@ class App:
 
     # ── Navigation ───────────────────────────────────────────────────────────
     def list_rows(self) -> int:
-        return max(1, self.H - 10)
+        return max(1, self.layout().rows)
 
     def move(self, delta: int) -> None:
         if self.focus == "side":
@@ -651,6 +696,8 @@ class App:
         self.poll()
         self.load_playlists()
         self.open_list("liked")
+        if self.engine:
+            self.bg(self.data, self.engine.start, fail=lambda e: None)
 
         while self.running:
             now = time.monotonic()
@@ -682,6 +729,10 @@ class App:
         if self.status and now >= self.status_until:
             self.status = ""
             self.dirty = True
+        if self.engine:
+            st = self.engine.status
+            if st != self.engine_status:
+                self.engine_status, self.dirty = st, True
 
     def wait_ms(self, now: float) -> int:
         if self.inflight:
@@ -709,6 +760,7 @@ class App:
         self.H, self.W = self.scr.getmaxyx()
         self.too_small = self.H < MIN_H or self.W < MIN_W
         self.scr.clear()
+        self._size = None   # the screen was wiped: repaint every region
         self.dirty = True
 
     def set_cursor(self, show: bool) -> None:
@@ -720,281 +772,457 @@ class App:
             self.cursor_shown = show
 
     # ── Rendering ────────────────────────────────────────────────────────────
+    # Every row remembers the key it was last drawn with (self._drawn: slot -> key) and is
+    # only rewritten when that key changes: a poll that changed nothing costs a few tuple
+    # compares, moving the selection rewrites two rows, and the screen is only erased when
+    # the terminal size or the overlay changes. Render state lives in class defaults so
+    # __init__ stays untouched; draw_all gives each App its own dict on the first frame.
+    _size: tuple | None = None
+    _drawn: dict = {}
+    _lay: tuple | None = None
+    _cols_key: tuple | None = None
+    _cols: Cols | None = None
+
+    def layout(self) -> Layout:
+        H, W = self.H, self.W
+        c = self._lay
+        if c is None or c[0] != (H, W):
+            roomy = H >= 20                    # blank rows around the list header and player
+            sw = max(16, min(30, W // 4))
+            x0, top = sw + 6, 2
+            rule_y = H - 5 if roomy else H - 4
+            h = max(1, rule_y - 1 - top)
+            head_y = top + (2 if roomy else 1)
+            rows = max(1, top + h - head_y - 1)
+            c = self._lay = ((H, W), Layout(sw, top, h, x0, max(10, W - x0 - 3), head_y, head_y + 1,
+                                            rows, rule_y))
+        return c[1]
+
+    def _changed(self, slot, key) -> bool:
+        if self._drawn.get(slot, _UNSET) == key:
+            return False
+        self._drawn[slot] = key
+        return True
+
     def render(self, now: float) -> None:
         pb = self.pb
-        playing = bool(pb and pb.track and pb.is_playing)
         if self.dirty:
-            self.draw_all(now)
-        elif playing and not self.too_small and not self.overlay \
+            drew = self.draw_all(now)
+        elif pb and pb.track and pb.is_playing and not self.too_small and not self.overlay \
                 and pb.progress(now) // 1000 != self.last_sec:
-            self.draw_progress(now)
+            drew = self.draw_progress(now)
         else:
             return
+        self.dirty = False
         if self.typing and self.cursor_at:
             self.scr.move(*self.cursor_at)
-        self.scr.refresh()
-        self.dirty = False
+            drew = True
+        if drew:
+            self.scr.refresh()
 
-    def draw_all(self, now: float) -> None:
+    def draw_all(self, now: float) -> bool:
         s, T = self.scr, self.theme
-        s.erase()
+        # The devices box resizes when the list arrives, so its row count is geometry too.
+        ndev = len(self.devices or ()) if self.overlay == "devices" else 0
+        size = (self.H, self.W, self.too_small, self.overlay, ndev)
+        fresh = size != self._size
+        if fresh:
+            self._size, self._drawn = size, {}
+            s.erase()
         self.cursor_at = None
         if self.too_small:
-            msg = f"Terminal too small ({self.W}x{self.H}, need {MIN_W}x{MIN_H})"
-            put(s, self.H // 2, max(0, (self.W - len(msg)) // 2), msg[: self.W - 1], T[WARN])
+            if fresh:
+                y = self.H // 2 - 1
+                for dy, text, attr in ((0, "Terminal too small", T[WARN]),
+                                       (1, f"{self.W}x{self.H}, need {MIN_W}x{MIN_H}", T[FAINT])):
+                    put(s, y + dy, max(0, (self.W - len(text)) // 2), text[: self.W - 1], attr)
             self.set_cursor(False)
-            return
-        self.draw_header()
-        self.draw_sidebar()
-        self.draw_main()
-        self.draw_player(now)
-        if self.overlay == "help":
-            self.draw_help()
-        elif self.overlay == "devices":
-            self.draw_devices()
+            return fresh
+        lay = self.layout()
+        drew = self.draw_header()
+        drew |= self.draw_sidebar(lay)
+        drew |= self.draw_main(lay)
+        drew |= self.draw_player(now, lay)
+        if self.overlay:
+            devs = tuple(self.devices) if self.devices is not None else None
+            if self._changed("overlay", (devs, self.dev_sel)) or drew:
+                if self.overlay == "help":
+                    self.draw_help()
+                elif self.overlay == "devices":
+                    self.draw_devices()
+                drew = True
         self.set_cursor(self.typing and self.cursor_at is not None)
+        return drew
 
-    def draw_header(self) -> None:
-        s, T, W, g = self.scr, self.theme, self.W, self.g
-        put(s, 0, 2, "spoterm", T[ACCENT] | curses.A_BOLD)
+    def draw_header(self) -> bool:
         pb = self.pb
-        if pb and pb.device_name:
-            dev = fit(pb.device_name, 28).rstrip()
-            x = W - 2 - width(dev)
-            put(s, 0, x - 2, g["dot"], T[ACCENT])
-            put(s, 0, x, dev, T[DIM])
+        dev = pb.device_name if pb else ""
+        live = bool(pb and pb.track and pb.is_playing)
+        eng = getattr(self, "engine_status", "")
+        if not self._changed("header", (dev, live, eng, self.status, self.status_warn)):
+            return False
+        s, T, g, W = self.scr, self.theme, self.g, self.W
+        put(s, 0, 0, " " * W)
+        put(s, 0, 2, "spoterm", T[ACCENT] | curses.A_BOLD)
+        x = W - 2
+        if dev:
+            name = fit(dev, 28).rstrip()
+            x -= width(name)
+            put(s, 0, x, name, T[DIM])
+            x -= 2
+            put(s, 0, x, g["dot"], T[ACCENT] if live else T[FAINT])
         else:
-            x = W - 2 - 9
+            x -= 9
             put(s, 0, x, "no device", T[FAINT])
-        avail = x - 13 - 3
-        msg = self.status or "? help"
-        attr = T[WARN] if self.status_warn and self.status else T[DIM] if self.status else T[FAINT]
+        if eng and eng != "off":
+            label = fit("engine " + eng + (g["ell"] if eng == "starting" else ""), 26).rstrip()
+            x -= width(label) + 3
+            put(s, 0, x, label, T[FAINT] if eng in ("ready", "starting") else T[DIM])
+        avail = x - 12 - 3
         if avail > 4:
-            put(s, 0, 13, fit(msg, avail).rstrip(), attr)
+            msg = self.status
+            attr = (T[WARN] if self.status_warn else T[TEXT]) if msg else T[FAINT]
+            put(s, 0, 12, fit(msg or "? help", avail).rstrip(), attr)
+        return True
 
-    def body(self) -> tuple:
-        side_w = max(18, min(32, self.W // 4))
-        return 2, self.H - 7, side_w   # top row, height, sidebar width
-
-    def draw_sidebar(self) -> None:
+    def draw_sidebar(self, lay: Layout) -> bool:
         s, T, g = self.scr, self.theme, self.g
-        top, h, sw = self.body()
-        self.side_top = _scroll(self.side_sel, self.side_top, h, len(self.side))
-        playing_ctx = self.pb.context_uri if self.pb else None
+        top, sw, side = lay.top, lay.side_w, self.side
+        self.side_top = _scroll(self.side_sel, self.side_top, lay.h, len(side))
+        ctx = self.pb.context_uri if self.pb else None
+        liked_ctx = bool(ctx) and ctx.endswith(":collection")
         focused = self.focus == "side" and not self.typing
-        for r in range(h):
+        cur, drew = self.cur.key, False
+        for r in range(lay.h):
             i = self.side_top + r
-            if i >= len(self.side):
-                break
-            it, y = self.side[i], top + r
-            if it.kind == "section":
-                put(s, y, 2, fit(it.label.upper(), sw - 1), T[FAINT] | curses.A_BOLD)
+            it = side[i] if i < len(side) else None
+            if it is not None and it.selectable:
+                is_ctx = liked_ctx if it.kind == "liked" else bool(it.playlist and it.playlist.uri == ctx)
+                state = (focused and i == self.side_sel, it.key == cur, is_ctx)
+            else:
+                state = focused
+            if not self._changed(("side", r), (it, state)):
                 continue
-            if it.kind == "note":
-                put(s, y, 2, fit(it.label, sw - 1), T[FAINT])
+            drew, y = True, top + r
+            if it is None or not it.selectable:
+                if it is not None and it.kind == "section":   # headings brighten with focus
+                    text, attr = it.label.upper(), (T[DIM] if focused else T[FAINT]) | curses.A_BOLD
+                else:
+                    text, attr = (it.label if it else ""), T[FAINT]
+                put(s, y, 1, " " + fit(text, sw + 1), attr)
                 continue
-            if not it.selectable:
-                continue
-            active = it.key == self.cur.key
-            is_ctx = bool(it.playlist and it.playlist.uri == playing_ctx) or \
-                (it.kind == "liked" and bool(playing_ctx) and playing_ctx.endswith(":collection"))
-            label = fit(" " + it.label, sw - 2) + (" " + g["play"] if is_ctx else "  ")
-            if i == self.side_sel and focused:
+            sel, active, is_ctx = state
+            if sel:
                 attr = T[SEL_ACCENT] if active else T[SEL]
-            elif active:
-                attr = T[ACCENT] | curses.A_BOLD
             else:
-                attr = T[TEXT]
-            put(s, y, 1, fit(label, sw + 1), attr)
+                attr = T[ACCENT] | curses.A_BOLD if active else T[TEXT]
+            put(s, y, 1, g["mark"] if sel else " ", T[MARK] if sel else 0)
+            put(s, y, 2, fit(it.label, sw - 1) + "  ", attr)
+            if is_ctx:
+                put(s, y, sw + 1, g["play"], T[SEL_ACCENT] if sel else T[ACCENT])
+        return drew
 
-    def draw_main(self) -> None:
-        s, T, g = self.scr, self.theme, self.g
-        top, h, sw = self.body()
-        x0 = sw + 4
-        w = self.W - x0 - 2
+    def columns(self, tl: TrackList, w: int) -> Cols:
+        """Column widths and header text, recomputed only when the list or width changes."""
+        key = (tl.key, tl.gen, len(tl.tracks), tl.total, w)
+        if key != self._cols_key:
+            num_w = max(2, len(str(max(tl.total, len(tl.tracks)))))
+            dur_w = 7 if any(t.duration_ms >= 3_600_000 for t in tl.tracks) else 5
+            avail = w - num_w - dur_w - 6
+            if avail >= 64:
+                title_w, artist_w = avail * 42 // 100, avail * 28 // 100
+                album_w = avail - title_w - artist_w - 2
+            else:
+                title_w = avail * 58 // 100
+                artist_w, album_w = avail - title_w, 0
+            head = " " + fit("#", num_w, right=True) + "  " + fit("Title", title_w) + "  " + fit("Artist", artist_w)
+            if album_w:
+                head += "  " + fit("Album", album_w)
+            head += "  " + fit("Time", dur_w, right=True) + "  "
+            self._cols_key, self._cols = key, Cols(num_w, title_w, artist_w, album_w, dur_w, head)
+        return self._cols
+
+    def draw_main(self, lay: Layout) -> bool:
         tl = self.cur
+        drew = self.draw_list_title(lay, tl)
+        if not tl.tracks:
+            return self.draw_empty(lay, tl) or drew
+        s, T, x0, w = self.scr, self.theme, lay.x0, lay.w
+        cols = self.columns(tl, w)
+        for y in range(lay.top + 1, lay.head_y):          # spacer rows
+            if self._changed(("main", y), None):
+                put(s, y, x0 - 1, " " * (w + 3))
+                drew = True
+        if self._changed(("main", lay.head_y), cols):
+            put(s, lay.head_y, x0 - 1, cols.head, T[FAINT])
+            drew = True
 
-        # title row
-        if tl.kind == "search":
-            put(s, top, x0, "Search", T[TITLE])
-            fx, fw = x0 + 8, max(4, w - 8 - 14)
-            put(s, top, fx, g["cursor"], T[ACCENT] if self.typing else T[FAINT])
-            q = self.query if self.typing else tl.query
-            if q or self.typing:
-                shown = q
-                while width(shown) > fw - 3 and shown:   # keep the tail visible while typing
-                    shown = shown[1:]
-                put(s, top, fx + 2, shown, T[TEXT])
-                if self.typing:
-                    off = width(q[: self.qcur]) - (width(q) - width(shown))
-                    self.cursor_at = (top, fx + 2 + max(0, off))
-            else:
-                put(s, top, fx + 2, "press / to search", T[FAINT])
+        rows, n = lay.rows, len(tl.tracks)
+        tl.top = top = _scroll(tl.sel, tl.top, rows, n)
+        span = n if tl.next_offset is None else max(n, tl.total)   # scrollbar covers the whole list
+        th = t0 = 0
+        if span > rows:
+            th = max(1, rows * rows // span)
+            t0 = min(rows - th, round((rows - th) * top / (span - rows)))
+        pb = self.pb
+        now_uri = pb.track.uri if pb and pb.track else None
+        now_state = 1 if pb and pb.is_playing else 2
+        focused = self.focus == "list" and not self.typing
+        for r in range(rows):
+            i, y, thumb = top + r, lay.list_y + r, t0 <= r < t0 + th
+            if i >= n:
+                more = tl.loading and i == n
+                if self._changed(("main", y), (more, thumb)):
+                    drew = True
+                    text = fit(" " * (cols.num_w + 2) + ("Loading" + self.g["ell"] if more else ""), w + 1)
+                    put(s, y, x0 - 1, " " + text + (self.g["thumb"] if thumb else " "), T[FAINT])
+                continue
+            t = tl.tracks[i]
+            sel = (2 if focused else 1) if i == tl.sel else 0
+            cur = now_state if t.uri == now_uri else 0
+            if self._changed(("main", y), (t, i, sel, cur, cols, thumb)):
+                self.draw_track(y, lay, cols, t, i, sel, cur, thumb)
+                drew = True
+        return drew
+
+    def draw_track(self, y: int, lay: Layout, c: Cols, t: Track, i: int, sel: int, cur: int,
+                   thumb: bool) -> None:
+        """One list row. sel: 0 no, 1 cursor in an unfocused pane, 2 focused; cur: 0, 1 playing, 2 paused."""
+        s, T, g = self.scr, self.theme, self.g
+        x, ell = lay.x0, g["ell"]
+        if sel == 2:
+            a_mark, a_dim = T[MARK], T[SEL_DIM]
+            a_num, a_title = (T[SEL_ACCENT], T[SEL_ACCENT]) if cur else (T[SEL_DIM], T[SEL])
+        elif not t.playable:
+            a_mark = a_num = a_title = a_dim = T[FAINT]
         else:
-            put(s, top, x0, fit(tl.title, max(1, w - 16)).rstrip(), T[TITLE])
+            a_mark, a_dim = T[FAINT], T[DIM]
+            a_num = (T[ACCENT] if cur == 1 else T[MUTED]) if cur else T[FAINT]
+            a_title = T[ACCENT] if cur else T[TEXT]
+        if sel == 1:
+            a_title |= curses.A_BOLD
+        num = (g["play"] if cur == 1 else g["pause"]) if cur else str(i + 1)
+        put(s, y, x - 1, g["mark"] if sel else " ", a_mark)
+        put(s, y, x, fit(num, c.num_w, ell, True), a_num)
+        x += c.num_w
+        put(s, y, x, "  " + fit(t.name, c.title_w, ell), a_title)
+        rest = "  " + fit(t.artists, c.artist_w, ell)
+        if c.album_w:
+            rest += "  " + fit(t.album, c.album_w, ell)
+        rest += "  " + fit(fmt_time(t.duration_ms), c.dur_w, ell, True) + " "
+        put(s, y, x + 2 + c.title_w, rest, a_dim)
+        put(s, y, lay.x0 + lay.w + 1, g["thumb"] if thumb else " ", T[FAINT])
 
+    def draw_list_title(self, lay: Layout, tl: TrackList) -> bool:
+        s, T, g = self.scr, self.theme, self.g
+        x0, w, y = lay.x0, lay.w, lay.top
+        info = ""
         if tl.total:
             info = f"{tl.total:,} " + ("result" if tl.kind == "search" else "song") + ("" if tl.total == 1 else "s")
-            put(s, top, x0 + w - len(info), info, T[DIM])
-
-        rows = h - 3
-        ly = top + 3
-        if not tl.tracks:
-            if tl.locked:
-                msg, attr = "Spotify doesn't let apps list this playlist. Press enter to play it", T[DIM]
-            elif tl.error:
-                msg, attr = f"{tl.error}  (R to retry)", T[WARN]
-            elif tl.loading:
-                msg, attr = "Loading…", T[DIM]
-            elif tl.kind == "search" and not tl.query:
-                msg, attr = "Type to search Spotify", T[FAINT]
-            else:
-                msg, attr = "Nothing here", T[FAINT]
-            msg = fit(msg, w).strip()
-            put(s, ly + rows // 3, x0 + max(0, (w - width(msg)) // 2), msg, attr)
-            return
-
-        # columns
-        num_w = max(2, len(str(max(tl.total, len(tl.tracks)))))
-        dur_w = 7 if any(t.duration_ms >= 3_600_000 for t in tl.tracks[tl.top:tl.top + rows]) else 5
-        avail = w - num_w - dur_w - 6
-        show_album = avail >= 80
-        if show_album:
-            title_w = avail * 42 // 100
-            artist_w = avail * 28 // 100
-            album_w = avail - title_w - artist_w - 2
+        if tl.kind == "search":
+            fx, fw = x0 + 8, max(4, w - 8 - len(info) - 2)
+            q = self.query if self.typing else tl.query
+            shown = q
+            while shown and width(shown) > fw - 3:   # keep the tail visible while typing
+                shown = shown[1:]
+            if self.typing:   # needed every frame, even when the row itself is unchanged
+                off = width(q[: self.qcur]) - (width(q) - width(shown))
+                self.cursor_at = (y, fx + 2 + max(0, off))
+            key = ("search", shown, self.typing, info)
         else:
-            title_w = avail * 58 // 100
-            artist_w = avail - title_w
-            album_w = 0
-
-        head = [("#", num_w, True), ("  ", 2, False), ("Title", title_w, False), ("  ", 2, False),
-                ("Artist", artist_w, False)]
-        if show_album:
-            head += [("  ", 2, False), ("Album", album_w, False)]
-        head += [("  ", 2, False), ("Time", dur_w, True)]
-        x = x0
-        for text, cw, right in head:
-            put(s, top + 2, x, fit(text, cw, right=right), T[FAINT])
-            x += cw
-
-        tl.top = _scroll(tl.sel, tl.top, rows, len(tl.tracks))
-        now_uri = self.pb.track.uri if self.pb and self.pb.track else None
-        focused = self.focus == "list" and not self.typing
-        ell = g["ell"]
-        for r in range(rows):
-            i = tl.top + r
-            if i >= len(tl.tracks):
-                if tl.loading and r < rows:
-                    put(s, ly + r, x0 + num_w + 2, "Loading…", T[FAINT])
-                break
-            t = tl.tracks[i]
-            playing = t.uri == now_uri
-            sel = i == tl.sel and focused
-            if sel:
-                a_num, a_title, a_dim = T[SEL_DIM], (T[SEL_ACCENT] if playing else T[SEL]), T[SEL_DIM]
-            elif not t.playable:
-                a_num = a_title = a_dim = T[FAINT]
+            focused = self.focus == "list"
+            key = ("title", tl.title, info, focused)
+        if not self._changed(("main", y), key):
+            return False
+        put(s, y, x0 - 1, " " * (w + 3))
+        if tl.kind == "search":
+            put(s, y, x0, "Search", T[TITLE])
+            put(s, y, fx, g["cursor"], T[ACCENT] if self.typing else T[FAINT])
+            if shown or self.typing:
+                put(s, y, fx + 2, shown, T[TEXT])
             else:
-                a_num = T[ACCENT] if playing else T[FAINT]
-                a_title = T[ACCENT] if playing else T[TEXT]
-                a_dim = T[DIM]
-            if i == tl.sel and not focused:
-                a_title |= curses.A_BOLD
-            num = g["play"] if playing else str(i + 1)
-            cells = [(fit(num, num_w, ell, True), a_num), ("  ", a_dim),
-                     (fit(t.name, title_w, ell), a_title), ("  ", a_dim),
-                     (fit(t.artists, artist_w, ell), a_dim)]
-            if show_album:
-                cells += [("  ", a_dim), (fit(t.album, album_w, ell), a_dim)]
-            cells += [("  ", a_dim), (fit(fmt_time(t.duration_ms), dur_w, ell, True), a_dim)]
-            x, y = x0, ly + r
-            for text, attr in cells:
-                put(s, y, x, text, attr)
-                x += width(text)
+                put(s, y, fx + 2, "press / to search", T[FAINT])
+        else:
+            attr = T[TITLE] if focused else T[TEXT] | curses.A_BOLD
+            put(s, y, x0, fit(tl.title, max(1, w - len(info) - 2)).rstrip(), attr)
+        if info:
+            put(s, y, x0 + w - len(info), info, T[DIM])
+        return True
 
-    def draw_player(self, now: float) -> None:
-        s, T, g, H, W = self.scr, self.theme, self.g, self.H, self.W
-        put(s, H - 4, 2, g["rule"] * (W - 4), T[FAINT])
+    def draw_empty(self, lay: Layout, tl: TrackList) -> bool:
+        ell = self.g["ell"]
+        if tl.locked:
+            msg, hint, role = "Spotify doesn't let apps list this playlist", "press enter to play it", DIM
+        elif tl.error:
+            msg, hint, role = tl.error, "press R to retry", WARN
+        elif tl.loading:
+            msg, hint, role = "Loading" + ell, "", DIM
+        elif tl.kind == "search" and not tl.query:
+            msg, hint, role = "Search Spotify", "type, then press enter" if self.typing else "press / to start", DIM
+        elif tl.kind == "search":
+            msg, hint, role = f'No results for "{tl.query}"', "try different words", DIM
+        else:
+            msg, hint, role = "Nothing here", "", DIM
+        s, T, x0, w = self.scr, self.theme, lay.x0, lay.w
+        my, drew = lay.top + 1 + (lay.h - 1) // 3, False
+        for y in range(lay.top + 1, lay.top + lay.h):
+            text, attr = (msg, T[role]) if y == my else (hint, T[FAINT]) if y == my + 1 else ("", 0)
+            if self._changed(("main", y), ("empty", text, attr)):
+                text = fit(text, w, ell).strip()
+                put(s, y, x0 - 1, " " + fit(" " * ((w - width(text)) // 2) + text, w + 2), attr)
+                drew = True
+        return drew
+
+    def draw_player(self, now: float, lay: Layout) -> bool:
+        s, T, g, W = self.scr, self.theme, self.g, self.W
+        y, drew = lay.rule_y, False
+        if self._changed("rule", None):
+            put(s, y, 2, g["rule"] * (W - 4), T[FAINT])
+            drew = True
         pb = self.pb
-        if not pb or not pb.track:
-            put(s, H - 3, 4, "Nothing playing", T[DIM])
-            put(s, H - 2, 4, fit("Start Spotify on any device, or press d to choose one", W - 6).rstrip(), T[FAINT])
-            return
-        t = pb.track
+        t = pb.track if pb else None
+        key = (t, pb.is_playing, self.liked if t.is_track else None, pb.shuffle, pb.repeat,
+               pb.volume) if t else None
+        if self._changed("player", key):
+            drew, blank = True, " " * (W - 1)
+            put(s, y + 1, 0, blank)
+            put(s, y + 2, 0, blank)
+            if t is None:
+                put(s, y + 1, 6, "Nothing playing", T[DIM])
+                hint = "Pick a song and press enter to play here, or press d to choose a device"
+                put(s, y + 2, 6, fit(hint, W - 9).rstrip(), T[FAINT])
+                put(s, y + 3, 0, blank)
+                self._drawn.pop("bar", None)
+            else:
+                self.draw_now_playing(y + 1, pb, t)
+        if t is not None:
+            drew |= self.draw_progress(now)
+        return drew
 
-        flags = []
-        if t.is_track and self.liked is not None:
-            flags.append((g["heart"], T[ACCENT] if self.liked else T[FAINT]))
-        flags.append(("shuffle", T[ACCENT] if pb.shuffle else T[FAINT]))
-        flags.append(("repeat 1" if pb.repeat == "track" else "repeat",
-                      T[ACCENT] if pb.repeat != "off" else T[FAINT]))
+    def draw_now_playing(self, y: int, pb: Playback, t: Track) -> None:
+        s, T, g, W = self.scr, self.theme, self.g, self.W
+        live, right = pb.is_playing, W - 3
+        put(s, y, 3, g["play"] if live else g["pause"], T[ACCENT] | curses.A_BOLD if live else T[MUTED])
+
+        # title row: name and like state on the left, shuffle and repeat on the right
+        rep = "repeat 1" if pb.repeat == "track" else "repeat"
+        x = right - len(rep)
+        put(s, y, x, rep, T[ACCENT] if pb.repeat != "off" else T[FAINT])
+        x -= 3 + 7
+        put(s, y, x, "shuffle", T[ACCENT] if pb.shuffle else T[FAINT])
+        heart = g["heart"] if t.is_track and self.liked is not None else ""
+        name = fit(t.name, max(1, x - 9 - (width(heart) + 2 if heart else 0))).rstrip()
+        put(s, y, 6, name, T[TITLE])
+        if heart:
+            put(s, y, 6 + width(name) + 2, heart, T[ACCENT] if self.liked else T[FAINT])
+
+        # artist row, with the volume meter on the right
+        x = right
         if pb.volume is not None:
-            flags.append((f"vol {pb.volume:>3}%", T[DIM]))
-        flags_w = sum(width(f) for f, _ in flags) + 3 * (len(flags) - 1)
-
-        icon = g["play"] if pb.is_playing else g["pause"]
-        put(s, H - 3, 3, icon, T[ACCENT] | curses.A_BOLD)
-        put(s, H - 3, 6, fit(t.name, max(1, W - 12 - flags_w)).rstrip(), T[TITLE])
-        x = W - 3 - flags_w
-        for text, attr in flags:
-            put(s, H - 3, x, text, attr)
-            x += width(text) + 3
-
+            vol, ramp = pb.volume, g["ramp"]
+            x -= 3
+            put(s, y + 1, x, f"{vol:>3}", T[DIM])
+            if ramp:
+                k = (vol * len(ramp) + 50) // 100
+                x -= len(ramp) + 1
+                put(s, y + 1, x, ramp[:k], T[TEXT])
+                put(s, y + 1, x + k, ramp[k:], T[FAINT])
+            else:
+                x -= 4
+                put(s, y + 1, x, "vol", T[FAINT])
         sub = t.artists + (g["sep"] + t.album if t.album else "")
-        put(s, H - 2, 6, fit(sub, W - 9).rstrip(), T[DIM])
-        self.draw_progress(now)
+        put(s, y + 1, 6, fit(sub, max(1, x - 9)).rstrip(), T[DIM])
 
-    def draw_progress(self, now: float) -> None:
+    def draw_progress(self, now: float) -> bool:
+        """The once-a-second path: usually rewrites just the elapsed time and one bar cell."""
         s, T, g, W = self.scr, self.theme, self.g, self.W
         pb = self.pb
-        y, x = self.H - 1, 6
-        cur, dur = pb.progress(now), pb.track.duration_ms
+        t = pb.track
+        y = self.layout().rule_y + 3
+        cur, dur = pb.progress(now), t.duration_ms
+        self.last_sec = cur // 1000
         right = fmt_time(dur)
         left = fmt_time(cur).rjust(len(right))
-        bar_w = max(4, W - x - len(left) - len(right) - 6)
-        filled = min(bar_w, bar_w * cur // dur) if dur else 0
-        put(s, y, x, left + " ", T[DIM])
-        x += len(left) + 1
-        put(s, y, x, g["bar_on"] * filled, T[ACCENT])
-        put(s, y, x + filled, g["bar_off"] * (bar_w - filled), T[FAINT])
-        put(s, y, x + bar_w, " " + right, T[DIM])
-        self.last_sec = cur // 1000
+        bx = 6 + len(left) + 2
+        bw = max(4, W - 3 - len(right) - 2 - bx)
+        filled = min(bw, bw * cur // dur) if dur else 0
+        on = T[ACCENT] if pb.is_playing else T[MUTED]
+        geo = (t, pb.is_playing, bw)
+        old = self._drawn.get("bar")
+        if old is not None and old[0] == geo:
+            if old[1] == left and old[2] == filled:
+                return False
+            if old[1] != left:
+                put(s, y, 6, left, T[DIM])
+            if filled > old[2]:
+                put(s, y, bx + old[2], g["bar_on"] * (filled - old[2]), on)
+            elif filled < old[2]:
+                put(s, y, bx + filled, g["bar_off"] * (old[2] - filled), T[FAINT])
+        else:
+            put(s, y, 0, " " * (W - 1))
+            put(s, y, 6, left, T[DIM])
+            put(s, y, bx, g["bar_on"] * filled, on)
+            put(s, y, bx + filled, g["bar_off"] * (bw - filled), T[FAINT])
+            put(s, y, bx + bw + 2, right, T[DIM])
+        self._drawn["bar"] = (geo, left, filled)
+        return True
 
-    def box(self, h: int, w: int, title: str) -> tuple:
+    def box(self, h: int, w: int, title: str, hint: str = "") -> tuple:
+        """A centred panel; returns the content area (y, x, h, w) inside a 2-column padding."""
         s, T, g = self.scr, self.theme, self.g
         h, w = min(h, self.H - 2), min(w, self.W - 4)
         y, x = (self.H - h) // 2, (self.W - w) // 2
         put(s, y, x, g["tl"] + g["h"] * (w - 2) + g["tr"], T[FAINT])
-        for r in range(1, h - 1):
-            put(s, y + r, x, g["v"] + " " * (w - 2) + g["v"], T[FAINT])
-        put(s, y + h - 1, x, g["bl"] + g["h"] * (w - 2) + g["br"], T[FAINT])
         put(s, y, x + 2, f" {title} ", T[TITLE])
-        return y + 1, x + 2, h - 2, w - 4
+        side = g["v"] + " " * (w - 2) + g["v"]
+        for r in range(1, h - 1):
+            put(s, y + r, x, side, T[FAINT])
+        put(s, y + h - 1, x, g["bl"] + g["h"] * (w - 2) + g["br"], T[FAINT])
+        if hint and len(hint) + 8 <= w:
+            put(s, y + h - 1, x + w - len(hint) - 4, f" {hint} ", T[DIM])
+        return y + 1, x + 3, h - 2, w - 6
 
     def draw_help(self) -> None:
-        T = self.theme
-        y, x, h, w = self.box(len(HELP) + 4, 48, "keys")
-        for r, (k, desc) in enumerate(HELP[: h - 2]):
-            put(self.scr, y + 1 + r, x + 1, fit(k, 12), T[ACCENT])
-            put(self.scr, y + 1 + r, x + 14, fit(desc, w - 15), T[TEXT])
+        s, T = self.scr, self.theme
+        kw = 8
+        dw = max(len(d) for _, items in HELP for _, d in items)
+        colw, n = kw + dw, max(len(items) for _, items in HELP)
+        two = self.W - 4 - 6 >= 2 * colw + 2
+        want = (n + 5, 2 * colw + 10) if two else (sum(len(i) + 2 for _, i in HELP) + 3, colw + 6)
+        y, x, h, w = self.box(*want, "Keys", "esc close")
+        r = 1
+        for c, (name, items) in enumerate(HELP):
+            cx = x + c * (w - colw) if two else x
+            if two:
+                r = 1
+            for k, d in ((name.upper(), None), *items):
+                if r >= h:
+                    break
+                if d is None:
+                    put(s, y + r, cx, fit(k, colw), T[FAINT] | curses.A_BOLD)
+                else:
+                    put(s, y + r, cx, fit(k, kw), T[ACCENT])
+                    put(s, y + r, cx + kw, fit(d, dw), T[TEXT])
+                r += 1
+            r += 1
 
     def draw_devices(self) -> None:
         s, T, g = self.scr, self.theme, self.g
         devs = self.devices
-        n = len(devs) if devs else 1
-        y, x, h, w = self.box(n + 4, 52, "devices")
+        y, x, h, w = self.box((len(devs) if devs else 2) + 4, 56, "Devices",
+                              "enter select  esc close" if devs else "esc close")
         if devs is None:
-            put(s, y + 1, x + 1, "Looking for devices…", T[DIM])
+            put(s, y + 1, x, "Looking for devices" + g["ell"], T[DIM])
             return
         if not devs:
-            put(s, y + 1, x + 1, fit("No devices. Open Spotify on any device.", w - 2), T[DIM])
+            put(s, y + 1, x, fit("No devices found", w), T[DIM])
+            put(s, y + 2, x, fit("Open Spotify on a phone or computer", w), T[FAINT])
             return
         for r, d in enumerate(devs[: h - 2]):
             sel = r == self.dev_sel
-            mark = g["dot"] if d.is_active else " "
-            line = fit(f" {mark} {d.name}", w - 14) + fit(d.type.lower(), 12, right=True) + " "
-            put(s, y + 1 + r, x, line, T[SEL] if sel else (T[ACCENT] if d.is_active else T[TEXT]))
+            name = fit(f"{g['dot'] if d.is_active else ' '} {d.name}", w - 12)
+            put(s, y + 1 + r, x - 1, " " + name, T[SEL] if sel else T[ACCENT] if d.is_active else T[TEXT])
+            put(s, y + 1 + r, x + w - 12, fit(d.type.lower(), 12, right=True) + " ", T[SEL_DIM] if sel else T[DIM])
 
 
 def main() -> None:
@@ -1005,20 +1233,37 @@ def main() -> None:
 
     auth = api.make_auth(settings)
     try:
-        if not auth.validate_token(auth.cache_handler.get_cached_token()):
-            print("Opening your browser to log in to Spotify…")
-        auth.get_access_token(as_dict=False)
-    except KeyboardInterrupt:
+        if auth.needs_login():
+            auth.login()
+        else:
+            try:
+                auth.token()    # refresh now, so a revoked session is caught before curses starts
+            except api.AuthError:
+                auth.login()
+    except (KeyboardInterrupt, EOFError):
         sys.exit(1)
     except Exception as e:
-        sys.exit(f"Spotify login failed: {e}")
+        sys.exit(f"Spotify login failed: {describe_error(e)}")
+
+    engine = Engine(settings) if settings.engine else None
+    if engine and engine.available() and engine.needs_login():
+        try:
+            engine.login(auth.token)    # silent with SpoTerm's token when Spotify accepts it
+        except KeyboardInterrupt:
+            print("Skipped: SpoTerm will control your other Spotify devices only.")
+        except Exception as e:
+            print(f"Built-in player unavailable: {e}")
 
     # Library log output would scribble over the UI, so send it to a file instead.
     logging.basicConfig(filename=config.config_dir() / "spoterm.log", level=logging.WARNING,
                         format="%(asctime)s %(name)s %(levelname)s %(message)s")
     os.environ.setdefault("ESCDELAY", "25")
-    client = api.Spotify(auth)
+    client = api.Spotify(auth, engine)
     try:
-        curses.wrapper(lambda scr: App(scr, client, settings).run())
+        curses.wrapper(lambda scr: App(scr, client, settings, engine).run())
     except KeyboardInterrupt:
         pass
+    finally:
+        if engine:
+            engine.enabled = False  # a worker still inside _fallback_device must not respawn it
+            engine.stop()
