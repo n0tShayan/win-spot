@@ -10,7 +10,8 @@ import time
 PAGE_SIZE = 50
 PLAYLIST_PAGE_SIZE = 100
 SEARCH_PAGE_SIZE = 10     # Spotify rejects search limits above 10
-_ITEM_FIELDS = "uri,name,duration_ms,type,is_local,is_playable,artists(name),album(name),show(name)"
+_ITEM_FIELDS = ("uri,name,duration_ms,type,is_local,is_playable,linked_from(uri),artists(name),"
+                "album(name),show(name)")
 # Spotify renamed each playlist entry's "track" key to "item"; ask for both.
 _PLAYLIST_FIELDS = f"total,next,items(is_local,item({_ITEM_FIELDS}),track({_ITEM_FIELDS}))"
 
@@ -122,6 +123,11 @@ def _num(v, default: int = 0) -> int:
 def _track(item: dict, pos: int, is_local: bool = False) -> Track | None:
     if not isinstance(item, dict) or not isinstance(item.get("uri"), str):
         return None
+    # With a market, Spotify swaps in a regional copy of some tracks (relinking). Keep the
+    # original URI: it is the one in the playlist, so playing "from this track" finds it,
+    # and it matches what the player reports.
+    linked = item.get("linked_from")
+    uri = linked["uri"] if isinstance(linked, dict) and isinstance(linked.get("uri"), str)         and linked["uri"].startswith("spotify:") else item["uri"]
     if item.get("type") == "episode":
         artists = (item.get("show") or {}).get("name", "")
         album = ""
@@ -129,7 +135,7 @@ def _track(item: dict, pos: int, is_local: bool = False) -> Track | None:
         artists = ", ".join(str(a.get("name") or "") for a in item.get("artists") or [] if isinstance(a, dict))
         album = (item.get("album") or {}).get("name") or ""
     return Track(
-        uri=item["uri"],
+        uri=uri,
         name=str(item.get("name") or "Unknown"),
         artists=artists,
         album=album,
@@ -181,7 +187,7 @@ class Spotify:
 
     # ── Reads ────────────────────────────────────────────────────────────────
     def playback(self) -> Playback | None:
-        r = self._call("GET", "me/player", {"additional_types": "episode"})
+        r = self._call("GET", "me/player", {"additional_types": "episode", "market": "from_token"})
         now = time.monotonic()
         if not isinstance(r, dict) or not r:
             return None
@@ -280,6 +286,11 @@ class Spotify:
         body = {"context_uri": context_uri, "uris": uris, "offset": offset}
         body = {k: v for k, v in body.items() if v is not None}
         self._with_device(lambda dev: self._player("PUT", "play", dev, body=body))
+
+    def play_on(self, device_id: str, *, context_uri: str, offset: dict | None = None):
+        """Start a context on one given device (Spotify resolves the context server side)."""
+        body = {"context_uri": context_uri, "offset": offset}
+        self._player("PUT", "play", device_id, body={k: v for k, v in body.items() if v is not None})
 
     def play_liked(self, track: Track, fallback_uris: list):
         """Play inside the Liked Songs context so the queue continues; fall back to a URI list."""

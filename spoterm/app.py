@@ -206,18 +206,26 @@ class App:
         self.local = False                      # our engine is the device playing
         self.expect_until = 0.0                 # engine reply expected: wake quickly till then
         self.pending_play = None                # a play request waiting for the engine to start
+        self.pending_until = 0.0
+        self.busy_since = 0.0                   # when the UI started waiting on a reply
         self.engine_volume: int | None = None
         self.restarts: list = []                # recent engine restart times
         self.restart_at = 0.0
         # After a local play: ignore the engine's late events for anything but this track,
-        # and ignore Spotify still naming the previous device, for a moment.
+        # and ignore Spotify still naming the previous device, for a moment. Events held back
+        # meanwhile are kept, so if the track never shows up the screen still ends up true.
         self.expect_uri: str | None = None
         self.expect_name = ""
         self.expect_deadline = 0.0
+        self.expect_retry = None                # plan B if the engine starts the wrong track
+        self.held_track: tuple | None = None    # (event, time) held back while expecting
+        self.held_state: tuple | None = None
         self.local_grace_until = 0.0
         self.vol_echo, self.shuffle_echo, self.repeat_echo = Echo(), Echo(), Echo()
         self.play_echo, self.seek_echo = Echo(), Echo()
-        self.remote_expect: tuple | None = None     # (uri, name, deadline) after a remote play
+        # After a remote play or skip: (uri wanted, its name, uri to move away from, deadline).
+        # Spotify reports the previous track for a moment; those polls are skipped.
+        self.remote_expect: tuple | None = None
         # Changes made on a remote device, shown until Spotify reports them (it lags):
         # field -> (value, deadline).
         self.holds: dict = {}
@@ -257,6 +265,8 @@ class App:
 
     # ── Background jobs ──────────────────────────────────────────────────────
     def bg(self, worker, fn, done=None, fail=None) -> None:
+        if not self.inflight:
+            self.busy_since = time.monotonic()
         self.inflight += 1
         worker.submit(fn, done, fail if fail is not None else self.on_error)
 
@@ -298,7 +308,10 @@ class App:
         """Send a command to our own player if it is the active device."""
         if not (self.local and self.engine and self.engine.send(cmd, **args)):
             return False
-        self.expect_until = time.monotonic() + 2.0
+        now = time.monotonic()
+        if now >= self.expect_until:
+            self.busy_since = now
+        self.expect_until = now + 2.0
         return True
 
     def _local_pb(self, now: float) -> Playback:
@@ -306,8 +319,10 @@ class App:
         eng, pb = self.engine, self.pb
         if not self.local or pb is None or pb.device_id != eng.device_id:
             old = pb if pb is not None and pb.device_id == eng.device_id else None
+            # Shuffle and repeat follow you from device to device, as in Spotify's own apps.
             pb = Playback(old.track if old else None, False, 0, now, eng.device_id, eng.name,
-                          old.volume if old else self.engine_volume, False, "off", None)
+                          old.volume if old else self.engine_volume,
+                          pb.shuffle if pb else False, pb.repeat if pb else "off", None)
             self.pb, self.local = pb, True
             self.holds.clear()
             self.remote_expect = None
@@ -329,7 +344,9 @@ class App:
             return
         if kind == "exit":
             was_local, self.local = self.local, False
-            self.pending_play = None
+            self.pending_play = self.expect_uri = self.expect_retry = None
+            self.held_track = self.held_state = None
+            self.next_poll = now        # polling was off while the engine played: resume it
             if was_local:
                 self.pb = None
             # The engine carries both the player and every API call, so bring it back.
@@ -381,21 +398,57 @@ class App:
         if kind not in ("track", "playing", "paused", "loading", "pos", "stopped", "end", "unavailable"):
             return
 
-        # Just after you pick a track, the engine is still reporting on the one before it
-        # (stopped, paused, even "track" for it). Only the track you picked may update the
-        # screen, until it shows up or the wait times out.
-        uri = text("uri")
+        if self.expect_uri and now >= self.expect_deadline:
+            self.expect_done(now)
         if self.expect_uri:
-            if now >= self.expect_deadline:
-                self.expect_uri = None
-            elif kind == "track" and (uri == self.expect_uri or text("name") == self.expect_name):
-                self.expect_uri = None      # Spotify may relink to a regional copy: same name
-            elif kind == "unavailable" and uri == self.expect_uri:
-                self.expect_uri = None
-            elif uri != self.expect_uri or kind not in ("loading", "playing"):
-                return      # includes stopped/paused left over from replaying the same track
+            # Just after you pick a track, the engine is still reporting on the one before it
+            # (stopped, paused, even "track" for it). Only the track you picked may update the
+            # screen until it shows up. The rest is held back, not dropped: if the track never
+            # shows up, expect_done shows what the engine is really playing.
+            uri = text("uri")
+            if uri == self.expect_uri or (kind == "track" and text("name") == self.expect_name):
+                if kind in ("track", "playing", "paused", "unavailable"):
+                    self.expect_uri = self.expect_retry = None
+                    self.held_track = self.held_state = None
+            elif kind == "track" and self.expect_retry:
+                # The engine started some other track (librespot only sees the first page of
+                # a long playlist): have Spotify start the right one on this device instead.
+                retry, self.expect_retry = self.expect_retry, None
+                self.held_track, self.held_state = (ev, now), None
+                self.expect_deadline = now + 6.0
+                retry()
+                return
+            else:
+                if kind == "track":
+                    self.held_track, self.held_state = (ev, now), None
+                elif kind in ("playing", "paused", "pos", "stopped"):
+                    self.held_state = (ev, now)
+                return
+        self.apply_engine(ev, now, now)
+
+    def expect_done(self, now: float) -> None:
+        """The track asked for never showed up: show what the engine is really doing."""
+        held = (self.held_track, self.held_state)
+        self.expect_uri = self.expect_retry = None
+        self.held_track = self.held_state = None
+        for h in held:
+            if h:
+                self.apply_engine(h[0], h[1], now)
+        self.dirty = True
+
+    def apply_engine(self, ev: dict, at: float, now: float) -> None:
+        """Show one engine playback event that arrived at `at`."""
+        kind = ev.get("ev")
+        text = lambda k, default="": ev[k] if isinstance(ev.get(k), str) else default
+        num = lambda k: max(0, api._num(ev.get(k)))
+        uri = text("uri")
         if kind == "unavailable":
-            self.flash("That track isn't available here, skipping", warn=True)
+            # Also sent for a queued track that failed to preload: only speak up for this one.
+            pb = self.pb
+            if self.local and pb and pb.track and pb.track.uri == uri:
+                self.flash("That track isn't available here, skipping", warn=True)
+            return
+        if kind == "end":
             return
         if kind in ("playing", "paused") and not self.play_echo.accept(now, kind == "playing"):
             return                      # echo of an earlier play/pause press
@@ -404,16 +457,18 @@ class App:
 
         pb = self._local_pb(now)
         if kind == "track":
-            pb.track = Track(text("uri"), text("name") or "Unknown", text("artists"), text("album"),
-                             num("duration_ms"), 0)
+            if not (pb.track and pb.track.uri == uri):   # same track: keep it, nothing to redraw
+                pb.track = Track(uri, text("name") or "Unknown", text("artists"), text("album"),
+                                 num("duration_ms"), 0)
             pb.progress_ms, pb.fetched_at = 0, now
             self.track_changed(pb.track)
         elif kind in ("playing", "paused", "loading", "pos"):
-            pb.progress_ms, pb.fetched_at = num("pos"), now
             if kind == "playing":
                 pb.is_playing = True
             elif kind == "paused":
                 pb.is_playing = False
+            late = int((now - at) * 1000) if pb.is_playing and kind != "loading" else 0
+            pb.progress_ms, pb.fetched_at = num("pos") + late, now
         elif kind == "stopped":
             pb.rebase(now)
             pb.is_playing = False
@@ -464,8 +519,11 @@ class App:
                 return
             self.local = False                  # playback moved to another device
         exp = self.remote_expect
-        if exp and pb and pb.track:
-            if pb.track.uri == exp[0] or pb.track.name == exp[1] or now >= exp[2]:
+        if exp:
+            want, want_name, avoid, deadline = exp
+            t = pb.track if pb else None
+            if now >= deadline or (t and (t.uri == want or t.name == want_name if want
+                                          else t.uri != avoid)):
                 self.remote_expect = None
             else:
                 self.next_poll = now + 0.7      # still the previous track: Spotify is lagging
@@ -473,6 +531,10 @@ class App:
         if pb and self.vol_target is not None:
             pb.volume = self.vol_target
         pending = bool(pb and self.holds and self.apply_holds(pb, now))
+        old = self.pb.track if self.pb else None
+        if pb and pb.track and old and old.uri == pb.track.uri and old.name == pb.track.name \
+                and old.duration_ms == pb.track.duration_ms:
+            pb.track = old      # the same object: the player rows aren't redrawn for nothing
         self.pb = pb
         track = pb.track if pb else None
         self.track_changed(track)
@@ -572,10 +634,18 @@ class App:
         return bool(self.engine and (self.engine.ready or self.engine.status == "starting"))
 
     def skip(self, forward: bool) -> None:
-        pb = self.pb
-        if pb and pb.track and (forward or pb.progress(time.monotonic()) < 3000):
-            pb.progress_ms, pb.fetched_at = 0, time.monotonic()   # instant feedback
+        pb, now = self.pb, time.monotonic()
+        # A pending seek belongs to the track being left: don't apply it to the next one.
+        self.seek_target, self.seek_deadline = None, 0.0
+        self.holds.pop("progress", None)
+        # "previous" past the first 3 seconds restarts the same track.
+        changes = bool(pb and pb.track and (forward or pb.progress(now) < 3000))
+        if pb and pb.track:
+            pb.progress_ms, pb.fetched_at = 0, now   # instant feedback
         if not self.send("next" if forward else "prev"):
+            if changes and not self.local:
+                # Until Spotify moves on, polls still name the old track: don't show it again.
+                self.remote_expect = (None, None, pb.track.uri, now + 4.0)
             self.command(self.api.next if forward else self.api.previous)
         self.dirty = True
 
@@ -584,7 +654,9 @@ class App:
         if not pb or not pb.track:
             return
         now = time.monotonic()
-        pos = max(0, min(pb.progress(now) + delta_ms, pb.track.duration_ms - 1000))
+        pos = max(0, pb.progress(now) + delta_ms)
+        if pb.track.duration_ms > 1000:   # 0 means unknown: don't clamp everything to 0
+            pos = min(pos, pb.track.duration_ms - 1000)
         pb.progress_ms, pb.fetched_at = pos, now
         self.dirty = True
         self.cmd_seq += 1   # a poll already in flight predates this seek: don't let it snap back
@@ -705,7 +777,12 @@ class App:
             self.command(lambda: self.api.play(context_uri=ctx))
             return
         if tl.kind == "playlist":
-            ctx, off = tl.context_uri, {"position": t.pos}
+            # Start from the track itself, not its position: with shuffle on, Spotify applies
+            # a position offset to the shuffled order and starts a neighbouring track. Only a
+            # track that is in the playlist twice needs its position (which one you picked).
+            ctx = tl.context_uri
+            twice = sum(x.uri == t.uri for x in tl.tracks) > 1
+            off = {"position": t.pos} if twice and not (pb and pb.shuffle) else {"uri": t.uri}
             fn = lambda: self.api.play(context_uri=ctx, offset=off)
         else:
             uris = [x.uri for x in tl.tracks[tl.sel:tl.sel + 100] if x.playable]
@@ -715,49 +792,70 @@ class App:
                 fn = lambda: self.api.play(uris=uris)
 
         now = time.monotonic()
+        ctx = self.list_context(tl)
         if self.pb:   # optimistic: show the new track immediately
             self.pb.track, self.pb.progress_ms, self.pb.fetched_at, self.pb.is_playing = t, 0, now, True
-            self.pb.context_uri = tl.context_uri
+            self.pb.context_uri = ctx
         else:
-            self.pb = Playback(t, True, 0, now, None, "", None, False, "off", tl.context_uri)
+            self.pb = Playback(t, True, 0, now, None, "", None, False, "off", ctx)
         self.track_changed(t)
-        self.remote_expect = (t.uri, t.name, now + 5.0)
+        self.remote_expect = (t.uri, t.name, None, now + 5.0)
+        self.seek_target, self.seek_deadline = None, 0.0
         self.holds.pop("progress", None)
         self.hold("is_playing", True)
         self.command(fn)
         self.dirty = True
 
+    def list_context(self, tl: TrackList) -> str | None:
+        """The context URI Spotify reports while this list plays (marks it in the sidebar)."""
+        if tl.kind == "liked":
+            return f"spotify:user:{self.user_id}:collection" if self.user_id else None
+        return tl.context_uri
+
     def play_here(self, tl: TrackList, t: Track | None) -> None:
         """Play on SpoTerm's own engine: one line down a pipe, no Web API call."""
-        if tl.kind == "playlist":
-            cmd, args = "play_context", {"uri": tl.context_uri, "track_uri": t.uri if t else None}
-        else:
-            # Liked Songs and search results play as a track list (what Myx does too), so the
-            # queue runs through everything loaded and shuffle covers all of it.
-            cmd, args = "play_tracks", {"uris": [x.uri for x in tl.tracks if x.playable],
-                                        "start_uri": t.uri}
-
         def go():
             now = time.monotonic()
+            pb = self.pb
+            # Shuffle and repeat carry over (a load would otherwise reset them to off).
+            shuffle, repeat = (pb.shuffle, pb.repeat) if pb else (False, "off")
+            if tl.kind == "playlist":
+                cmd, args = "play_context", {"uri": tl.context_uri, "track_uri": t.uri if t else None}
+            else:
+                # Liked Songs and search results play as a track list (what Myx does too), so
+                # the queue runs through everything loaded and shuffle covers all of it.
+                cmd, args = "play_tracks", {"uris": [x.uri for x in tl.tracks if x.playable],
+                                            "start_uri": t.uri}
             self.local = True
             self.local_grace_until = now + 8.0
             pb = self._local_pb(now)
-            pb.context_uri = tl.context_uri
+            pb.context_uri = self.list_context(tl)
+            pb.shuffle, pb.repeat = shuffle, repeat
+            self.play_echo.until = self.seek_echo.until = 0.0   # earlier presses are moot now
+            self.seek_target, self.seek_deadline = None, 0.0
+            self.held_track = self.held_state = self.expect_retry = None
             if t is not None:
                 pb.track, pb.progress_ms, pb.fetched_at, pb.is_playing = t, 0, now, True
                 self.track_changed(t)
-                self.expect_uri, self.expect_name, self.expect_deadline = t.uri, t.name, now + 4.0
+                self.expect_uri, self.expect_name, self.expect_deadline = t.uri, t.name, now + 5.0
+                dev = self.engine.device_id
+                if tl.kind == "playlist" and dev:
+                    ctx, off = tl.context_uri, {"uri": t.uri}
+                    self.expect_retry = lambda: self.bg(
+                        self.cmd, lambda: self.api.play_on(dev, context_uri=ctx, offset=off))
             else:
                 self.expect_uri = None
-            if not self.send(cmd, **args):
+            if not self.send(cmd, shuffle=shuffle, repeat=repeat, **args):
                 self.local = False
+                self.expect_uri = self.expect_retry = None
                 self.flash("SpoTerm's player isn't running", warn=True)
             self.dirty = True
 
         if self.engine.ready:
             go()
         else:
-            self.pending_play = go
+            now = time.monotonic()
+            self.pending_play, self.pending_until, self.busy_since = go, now + 20.0, now
             self.flash("Starting SpoTerm's player…")
 
     def open_devices(self) -> None:
@@ -1128,6 +1226,12 @@ class App:
         if self.restart_at and now >= self.restart_at:
             self.restart_at = 0.0
             self.bg(self.data, self.engine.restart, lambda _: self.poll_soon(0), self.on_error)
+        if self.expect_uri and now >= self.expect_deadline:
+            self.expect_done(now)
+        if self.pending_play and now >= self.pending_until:
+            self.pending_play = None
+            self.flash("SpoTerm's player didn't start. Press r to retry, or d to pick a device",
+                       warn=True)
         if self.status and now >= self.status_until:
             self.status = ""
             self.dirty = True
@@ -1138,7 +1242,8 @@ class App:
 
     def wait_ms(self, now: float) -> int:
         if self.inflight or now < self.expect_until or self.pending_play:
-            return 40
+            # Replies usually land within a second: check often, then back off on a slow link.
+            return 40 if now - self.busy_since < 1.5 else 120
         t = self.next_poll - now
         pb = self.pb
         if pb and pb.is_playing and pb.track:
@@ -1151,6 +1256,8 @@ class App:
             t = min(t, self.seek_deadline - now)
         if self.restart_at:
             t = min(t, self.restart_at - now)
+        if self.expect_uri:
+            t = min(t, self.expect_deadline - now)
         return int(max(10, min(2000, t * 1000 + 5)))
 
     def resize(self) -> None:

@@ -160,7 +160,7 @@ How:
   can't inject terminal escape sequences.
 - The engine doesn't advertise itself on your network (no discovery), gets an
   environment with SpoTerm's settings and secrets removed, and exits with SpoTerm:
-  its stdin closes, and on Windows a Job Object kills it even if SpoTerm crashes.
+  its stdin closes when SpoTerm exits for any reason, crashes included.
 - Tokens are written atomically to the config folder (0600 on POSIX), never logged,
   and never in the repo. `.env` is gitignored.
 - `.env` files may only set `SPOTIPY_*`, `SPOTERM_*` and `HTTPS_PROXY`/`NO_PROXY`.

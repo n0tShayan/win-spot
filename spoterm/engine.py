@@ -123,9 +123,11 @@ class Engine:
         if self.needs_login() or not self.player_enabled:
             argv.append("--no-player")
         kwargs = {"creationflags": subprocess.CREATE_NO_WINDOW} if _WIN else {"start_new_session": True}
+        # Buffered pipes: unbuffered, every line read would cost one system call per byte
+        # (tens of thousands for a page of tracks). Writes are flushed line by line anyway.
         with open(self.log_path, "wb") as log:     # the child keeps its own handle
             self._proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                          stderr=log, env=self._env(), bufsize=0, **kwargs)
+                                          stderr=log, env=self._env(), **kwargs)
         self.ready, self.device_id, self._exit_code = False, None, None
         self.alive.clear()
         threading.Thread(target=self._read, args=(self._proc,), name="spoterm-engine",

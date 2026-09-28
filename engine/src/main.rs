@@ -207,6 +207,8 @@ enum Cmd {
         position_ms: u32,
         #[serde(default)]
         shuffle: bool,
+        #[serde(default)]
+        repeat: String,
     },
     PlayTracks {
         uris: Vec<String>,
@@ -214,6 +216,10 @@ enum Cmd {
         start_uri: Option<String>,
         #[serde(default)]
         position_ms: u32,
+        #[serde(default)]
+        shuffle: bool,
+        #[serde(default)]
+        repeat: String,
     },
     Play,
     Pause,
@@ -362,11 +368,28 @@ async fn connect(o: &Opts, mixer: &Arc<SoftMixer>, tx: &Tx) -> Result<Link> {
     let mut events = player.get_player_event_channel();
     let etx = tx.clone();
     tokio::spawn(async move {
+        // TrackChanged names the file that plays, which for a relinked track is a regional
+        // copy with another URI. The Playing/Paused that always follows it names the track
+        // that was asked for (the one in the playlist), so the track event takes that URI.
+        let mut track: Option<Value> = None;
         while let Some(ev) = events.recv().await {
-            if let Some(v) = event_json(ev) {
-                if etx.send(v).is_err() {
+            let Some(v) = event_json(ev) else { continue };
+            if v["ev"] == "track" {
+                track = Some(v);
+                continue;
+            }
+            if let Some(mut t) = track.take() {
+                if v["ev"] == "playing" || v["ev"] == "paused" {
+                    if v["uri"].as_str().is_some_and(|u| !u.is_empty()) {
+                        t["uri"] = v["uri"].clone();
+                    }
+                }
+                if etx.send(t).is_err() {
                     break;
                 }
+            }
+            if etx.send(v).is_err() {
+                break;
             }
         }
     });
@@ -451,25 +474,23 @@ fn handle(link: Option<&Link>, mixer: &Arc<SoftMixer>, tx: &Tx, cmd: Cmd) {
         let _ = spirc.activate();
     };
     let (name, result) = match cmd {
-        Cmd::PlayContext { uri, track_uri, index, position_ms, shuffle } => {
+        Cmd::PlayContext { uri, track_uri, index, position_ms, shuffle, repeat } => {
             activate();
             let options = LoadRequestOptions {
                 start_playing: true,
                 seek_to: position_ms,
-                context_options: shuffle.then(|| {
-                    LoadContextOptions::Options(CtxOptions { shuffle: true, ..Default::default() })
-                }),
+                context_options: Some(play_options(shuffle, &repeat)),
                 playing_track: track_uri.map(PlayingTrack::Uri).or(index.map(PlayingTrack::Index)),
             };
             ("play_context", spirc.load(LoadRequest::from_context_uri(uri, options)))
         }
-        Cmd::PlayTracks { uris, start_uri, position_ms } => {
+        Cmd::PlayTracks { uris, start_uri, position_ms, shuffle, repeat } => {
             activate();
             let options = LoadRequestOptions {
                 start_playing: true,
                 seek_to: position_ms,
+                context_options: Some(play_options(shuffle, &repeat)),
                 playing_track: start_uri.map(PlayingTrack::Uri),
-                ..Default::default()
             };
             ("play_tracks", spirc.load(LoadRequest::from_tracks(uris, options)))
         }
@@ -502,6 +523,16 @@ fn handle(link: Option<&Link>, mixer: &Arc<SoftMixer>, tx: &Tx, cmd: Cmd) {
         let msg = if link.session.is_invalid() { "reconnecting to Spotify".to_string() } else { e.to_string() };
         send(tx, json!({"ev": "error", "cmd": name, "msg": msg}));
     }
+}
+
+/// A load resets shuffle and repeat unless it says what they should be, so it always
+/// carries the ones SpoTerm shows.
+fn play_options(shuffle: bool, repeat: &str) -> LoadContextOptions {
+    LoadContextOptions::Options(CtxOptions {
+        shuffle,
+        repeat: repeat == "context",
+        repeat_track: repeat == "track",
+    })
 }
 
 fn event_json(ev: PlayerEvent) -> Option<Value> {
