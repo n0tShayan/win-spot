@@ -1,4 +1,4 @@
-# SpoTerm
+# Win-Spot
 
 A minimal, keyboard-driven Spotify player for the terminal. The UI is Python and
 curses; everything heavy lives in a small native engine (`spoterm-engine`, Rust on
