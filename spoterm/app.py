@@ -13,13 +13,12 @@ Design notes (why it stays near 0% CPU):
     thread, so there are no locks and no races.
 """
 
-import logging
+import json
 import os
 import queue
+import subprocess
 import sys
 import time
-from dataclasses import dataclass, field
-from typing import NamedTuple
 
 try:
     import curses
@@ -47,27 +46,23 @@ PADENTER = getattr(curses, "PADENTER", -999)
 BACKSPACE = (curses.KEY_BACKSPACE, "\b", "\x7f", "\x08")
 
 
-@dataclass
 class TrackList:
-    key: str
-    kind: str                      # "liked" | "playlist" | "search"
-    title: str
-    context_uri: str | None = None
-    playlist_id: str | None = None
-    query: str = ""
-    tracks: list = field(default_factory=list)
-    total: int = 0
-    next_offset: int | None = 0    # 0 = nothing loaded yet, None = fully loaded
-    loading: bool = False
-    error: str = ""
-    stale: bool = False
-    locked: bool = False           # Spotify won't list this playlist's tracks for us
-    gen: int = 0                   # bumped on reset so late results are dropped
-    sel: int = 0
-    top: int = 0
-    retry_at: float = 0.0          # after a failed page, don't ask again before this
-    want_end: bool = False         # G pressed: keep loading and follow the end
-    restore: int | None = None     # selection to return to once enough has reloaded
+    # A plain __slots__ class: dataclasses would pull inspect, ast and tokenize into memory.
+    __slots__ = ("key", "kind", "title", "context_uri", "playlist_id", "query", "tracks", "total",
+                 "next_offset", "loading", "error", "stale", "locked", "gen", "sel", "top",
+                 "retry_at", "want_end", "restore")
+
+    def __init__(self, key: str, kind: str, title: str, context_uri: str | None = None,
+                 playlist_id: str | None = None):
+        self.key = key
+        self.kind = kind                     # "liked" | "playlist" | "search"
+        self.title = title
+        self.context_uri = context_uri
+        self.playlist_id = playlist_id
+        self.query = ""
+        self.gen = 0                         # bumped on reset so late results are dropped
+        self.reset()
+        self.gen = 0
 
     def reset(self) -> None:
         self.gen += 1
@@ -84,12 +79,14 @@ class TrackList:
         self.restore = None
 
 
-@dataclass(frozen=True)
 class SideItem:
-    kind: str                      # "section" | "gap" | "note" | "liked" | "search" | "playlist"
-    label: str
-    key: str = ""
-    playlist: api.Playlist | None = None
+    __slots__ = ("kind", "label", "key", "playlist")
+
+    def __init__(self, kind: str, label: str, key: str = "", playlist=None):
+        self.kind = kind            # "section" | "gap" | "note" | "liked" | "search" | "playlist"
+        self.label = label
+        self.key = key
+        self.playlist: api.Playlist | None = playlist
 
     @property
     def selectable(self) -> bool:
@@ -119,28 +116,30 @@ HELP = (
 )
 
 
-@dataclass(frozen=True)
 class Layout:
     """Screen geometry for one terminal size (see App.layout)."""
-    side_w: int     # sidebar text width; its rows span columns 1 .. side_w + 2
-    top: int        # first body row (the list title)
-    h: int          # body height
-    x0: int         # main pane text column (the selection marker sits at x0 - 1)
-    w: int          # main pane text width (then one pad column and the scrollbar)
-    head_y: int     # column header row
-    list_y: int     # first track row
-    rows: int       # visible track rows
-    rule_y: int     # player rule; title, artist and progress rows follow it
+    __slots__ = ("side_w", "top", "h", "x0", "w", "head_y", "list_y", "rows", "rule_y")
+
+    def __init__(self, side_w, top, h, x0, w, head_y, list_y, rows, rule_y):
+        self.side_w = side_w    # sidebar text width; its rows span columns 1 .. side_w + 2
+        self.top = top          # first body row (the list title)
+        self.h = h              # body height
+        self.x0 = x0            # main pane text column (the selection marker sits at x0 - 1)
+        self.w = w              # main pane text width (then one pad column and the scrollbar)
+        self.head_y = head_y    # column header row
+        self.list_y = list_y    # first track row
+        self.rows = rows        # visible track rows
+        self.rule_y = rule_y    # player rule; title, artist and progress rows follow it
 
 
-class Cols(NamedTuple):
+class Cols:
     """Track-list column widths for one list and pane width (see App.columns)."""
-    num_w: int
-    title_w: int
-    artist_w: int
-    album_w: int
-    dur_w: int
-    head: str       # the column header row, pre-rendered
+    __slots__ = ("num_w", "title_w", "artist_w", "album_w", "dur_w", "head")
+
+    def __init__(self, num_w, title_w, artist_w, album_w, dur_w, head):
+        self.num_w, self.title_w, self.artist_w = num_w, title_w, artist_w
+        self.album_w, self.dur_w = album_w, dur_w
+        self.head = head        # the column header row, pre-rendered
 
 
 _UNSET = object()   # "never drawn", distinct from any row key
@@ -190,6 +189,8 @@ class App:
         self.expect_until = 0.0                 # engine reply expected: wake quickly till then
         self.pending_play = None                # a play request waiting for the engine to start
         self.engine_volume: int | None = None
+        self.restarts: list = []                # recent engine restart times
+        self.restart_at = 0.0
         self.user_id: str | None = None
 
         # library
@@ -282,11 +283,14 @@ class App:
         return pb
 
     def on_engine(self, ev: dict) -> None:
+        # Every field is checked: a malformed event must never reach the screen.
         kind, now = ev.get("ev"), time.monotonic()
+        text = lambda k, default="": ev[k] if isinstance(ev.get(k), str) else default
+        num = lambda k: max(0, api._num(ev.get(k)))
         self.dirty = True
         if kind == "ready":
             if ev.get("volume") is not None:
-                self.engine_volume = int(ev["volume"])
+                self.engine_volume = min(100, num("volume"))
             if self.pending_play:
                 fn, self.pending_play = self.pending_play, None
                 fn()
@@ -294,18 +298,25 @@ class App:
         if kind == "exit":
             was_local, self.local = self.local, False
             self.pending_play = None
-            code = ev.get("code")
-            if code == 3:
-                self.flash("SpoTerm's player needs you to sign in again: restart SpoTerm", warn=True)
-            elif code:
-                self.flash(f"SpoTerm's player stopped (see {self.engine.log_path})", warn=True)
             if was_local:
                 self.pb = None
-            self.poll_soon(0)
+            # The engine carries both the player and every API call, so bring it back.
+            # A crash loop gets three tries a minute, then waits for `r`.
+            self.restarts = [t for t in self.restarts if now - t < 60] + [now]
+            if len(self.restarts) <= 3:
+                self.flash("SpoTerm's engine stopped: restarting it…", warn=True)
+                self.restart_at = now + 1.0
+            else:
+                self.flash(f"SpoTerm's engine keeps stopping (see {self.engine.log_path}). "
+                           "Press r to try again", warn=True)
             return
         if kind == "error":
             if ev.get("kind") != "login":
-                self.flash(f"Player: {ev.get('msg', 'command failed')}", warn=True)
+                self.flash(f"Player: {text('msg', 'command failed')}", warn=True)
+            return
+        if kind == "player":
+            if ev.get("state") == "login":
+                self.flash("SpoTerm's player needs its sign-in: restart SpoTerm", warn=True)
             return
         if kind == "reconnecting":
             self.flash("Reconnecting to Spotify…")
@@ -319,15 +330,16 @@ class App:
             return
         if kind in ("volume", "shuffle", "repeat"):
             if kind == "volume":
-                self.engine_volume = int(ev.get("pct") or 0)
+                self.engine_volume = min(100, num("pct"))
             if not self.local or self.pb is None:
                 return
             if kind == "volume":
                 self.pb.volume = self.engine_volume
             elif kind == "shuffle":
-                self.pb.shuffle = bool(ev.get("on"))
+                self.pb.shuffle = ev.get("on") is True
             else:
-                self.pb.repeat = ev.get("mode") or "off"
+                mode = text("mode", "off")
+                self.pb.repeat = mode if mode in ("off", "context", "track") else "off"
             return
         if kind == "unavailable":
             self.flash("That track isn't available", warn=True)
@@ -337,12 +349,12 @@ class App:
 
         pb = self._local_pb(now)
         if kind == "track":
-            pb.track = Track(ev.get("uri") or "", ev.get("name") or "Unknown", ev.get("artists") or "",
-                             ev.get("album") or "", int(ev.get("duration_ms") or 0), 0)
+            pb.track = Track(text("uri"), text("name") or "Unknown", text("artists"), text("album"),
+                             num("duration_ms"), 0)
             pb.progress_ms, pb.fetched_at = 0, now
             self.track_changed(pb.track)
         elif kind in ("playing", "paused", "loading", "pos"):
-            pb.progress_ms, pb.fetched_at = int(ev.get("pos") or 0), now
+            pb.progress_ms, pb.fetched_at = num("pos"), now
             if kind == "playing":
                 pb.is_playing = True
             elif kind == "paused":
@@ -751,6 +763,9 @@ class App:
             self.load_more(tl)
 
     def refresh(self) -> None:
+        if self.engine and not self.engine.running():
+            self.restarts.clear()
+            self.bg(self.data, self.engine.restart, fail=self.on_error)
         self.load_playlists()
         tl = self.cur
         if tl.kind != "search" or tl.query:
@@ -986,6 +1001,9 @@ class App:
             self.flush_volume()
         if self.seek_deadline and now >= self.seek_deadline:
             self.flush_seek()
+        if self.restart_at and now >= self.restart_at:
+            self.restart_at = 0.0
+            self.bg(self.data, self.engine.restart, lambda _: self.poll_soon(0), self.on_error)
         if self.status and now >= self.status_until:
             self.status = ""
             self.dirty = True
@@ -1007,6 +1025,8 @@ class App:
             t = min(t, self.vol_deadline - now)
         if self.seek_deadline:
             t = min(t, self.seek_deadline - now)
+        if self.restart_at:
+            t = min(t, self.restart_at - now)
         return int(max(10, min(2000, t * 1000 + 5)))
 
     def resize(self) -> None:
@@ -1138,12 +1158,13 @@ class App:
         else:
             x -= 9
             put(s, 0, x, "no device", T[FAINT])
-        label = {"starting": "starting player" + g["ell"], "login needed": "player: sign-in needed",
-                 "not built": "player not built"}.get(eng, "player stopped" if eng.startswith("stopped") else "")
+        label = {"starting": "starting player" + g["ell"], "retrying": "player reconnecting" + g["ell"],
+                 "login needed": "player: sign-in needed", "not built": "player not built",
+                 }.get(eng, "player stopped" if eng.startswith("stopped") else "")
         if label and not self.status:    # a status message outranks the player label
             x -= width(label) + 3
             if x > 12:
-                put(s, 0, x, label, T[FAINT] if eng == "starting" else T[WARN])
+                put(s, 0, x, label, T[FAINT] if eng in ("starting", "retrying") else T[WARN])
             else:
                 x += width(label) + 3
         avail = x - 12 - 3
@@ -1495,39 +1516,69 @@ class App:
             put(s, y + 1 + r, x + w - 12, fit(d.type.lower(), 12, right=True) + " ", T[SEL_DIM] if sel else T[DIM])
 
 
+def _signed_in(settings: config.Settings) -> bool:
+    """SpoTerm's own sign-in exists and covers every scope we ask for."""
+    try:
+        with open(settings.token_path, encoding="utf-8") as f:
+            tok = json.load(f)
+        granted = set(str(tok.get("scope") or "").split())
+        return bool(tok.get("access_token")) and set(config.SCOPE.split()) <= granted
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def _run_login() -> bool:
+    """SpoTerm's browser sign-in, in its own process so TLS never loads into this one."""
+    try:
+        return subprocess.call([sys.executable, "-m", "spoterm.login"], cwd=config.PROJECT_DIR) == 0
+    except KeyboardInterrupt:
+        return False
+
+
 def main() -> None:
     try:
         settings = config.load()
     except config.ConfigError as e:
         sys.exit(str(e))
 
-    auth = api.make_auth(settings)
-    try:
-        if auth.needs_login():
-            auth.login()
-        else:
-            try:
-                auth.token()    # refresh now, so a revoked session is caught before curses starts
-            except api.AuthError:
-                auth.login()
-    except (KeyboardInterrupt, EOFError):
+    engine = Engine(settings)
+    if not engine.available():
+        sys.exit("SpoTerm's engine isn't built yet. From the project folder run:\n"
+                 "  cd engine\n  cargo build --release\n(see the README for details)")
+    if not _signed_in(settings) and not _run_login():
         sys.exit(1)
-    except Exception as e:
-        sys.exit(f"Spotify login failed: {describe_error(e)}")
-
-    engine = Engine(settings) if settings.engine else None
-    if engine and engine.available() and engine.needs_login():
+    if engine.needs_login():
         engine.login()
 
-    # Library log output would scribble over the UI, so send it to a file instead.
-    logging.basicConfig(filename=config.config_dir() / "spoterm.log", level=logging.WARNING,
-                        format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    try:
+        engine.start()
+        state = engine.check_web()
+        if state == "login":            # the saved sign-in was revoked or expired for good
+            engine.stop()
+            if not _run_login():
+                sys.exit(1)
+            engine.restart()
+            state = engine.check_web()
+        if state != "ok":
+            print(f"Warning: {state}. Starting anyway.")
+    except KeyboardInterrupt:
+        engine.stop()
+        sys.exit(1)
+
     os.environ.setdefault("ESCDELAY", "25")
-    client = api.Spotify(auth)
+    client = api.Spotify(engine)
     try:
         curses.wrapper(lambda scr: App(scr, client, settings, engine).run())
     except KeyboardInterrupt:
         pass
+    except Exception:
+        import traceback
+        path = os.path.join(config.config_dir(), "crash.log")
+        try:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(time.strftime("\n--- %Y-%m-%d %H:%M:%S ---\n") + traceback.format_exc())
+        except OSError:
+            pass
+        sys.exit(f"SpoTerm hit a bug and closed. Details were saved to {path}")
     finally:
-        if engine:
-            engine.stop()
+        engine.stop()

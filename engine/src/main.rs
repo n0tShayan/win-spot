@@ -3,13 +3,16 @@
 //! `spoterm-engine login --cache DIR` runs the one-time browser login and stores
 //! reusable credentials in DIR.
 //!
-//! `spoterm-engine run --cache DIR [--name NAME] [--bitrate 96|160|320] [--volume PCT]`
-//! brings up the Connect device and speaks JSON lines: commands on stdin, events on
-//! stdout, logs on stderr. Playback commands go straight to the local player, so they
-//! take effect instantly with no Web API round trip. Closing stdin shuts the player
-//! down, so it never outlives SpoTerm.
+//! `spoterm-engine run --cache DIR --client-id ID --token FILE [--name NAME]
+//! [--bitrate 96|160|320] [--volume PCT] [--no-player]` speaks JSON lines: commands on
+//! stdin, events on stdout, logs on stderr. It does two jobs for the Python UI:
 //!
-//! Exit codes: 0 normal, 1 error, 3 login needed.
+//! * plays audio as a Spotify Connect device; playback commands go straight to the
+//!   local player, so they act instantly with no Web API round trip;
+//! * makes Web API calls (`api` commands) with SpoTerm's own token, so the UI needs no
+//!   TLS or HTTP code of its own.
+//!
+//! Closing stdin shuts everything down, so it never outlives SpoTerm.
 //!
 //! Session and Spirc wiring follows Myx (MIT, © Haseeb Khalid) and spotify-player
 //! (MIT, © Thang Pham).
@@ -29,7 +32,9 @@ use librespot_core::config::DeviceType;
 use librespot_core::{authentication::Credentials, Session, SessionConfig};
 use librespot_metadata::audio::UniqueFields;
 use librespot_oauth::OAuthClientBuilder;
-use librespot_playback::audio_backend;
+use librespot_playback::audio_backend::{self, Sink, SinkBuilder, SinkError, SinkResult};
+use librespot_playback::convert::Converter;
+use librespot_playback::decoder::AudioPacket;
 use librespot_playback::config::{AudioFormat, Bitrate, PlayerConfig};
 use librespot_playback::mixer::softmixer::SoftMixer;
 use librespot_playback::mixer::{Mixer, MixerConfig};
@@ -38,6 +43,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+
+mod web;
 
 /// librespot's public desktop client id. Spotify only lets this kind of client
 /// register a Connect device; a developer-dashboard client id gets
@@ -56,7 +63,6 @@ const SCOPES: &[&str] = &[
     "playlist-read-private",
     "playlist-read-collaborative",
 ];
-const EXIT_LOGIN: i32 = 3;
 const HEALTH_CHECK: Duration = Duration::from_secs(5);
 const RETRY_MIN: Duration = Duration::from_secs(5);
 const RETRY_MAX: Duration = Duration::from_secs(120);
@@ -68,6 +74,9 @@ struct Opts {
     name: String,
     bitrate: Bitrate,
     volume_pct: u8,
+    client_id: String,
+    token: PathBuf,
+    player: bool,
 }
 
 fn main() {
@@ -77,7 +86,8 @@ fn main() {
     let result = parse_args().and_then(|(mode, opts)| match mode.as_str() {
         "login" => login(&opts),
         "run" => run(opts),
-        _ => bail!("usage: spoterm-engine login|run --cache DIR [--name N] [--bitrate 96|160|320] [--volume PCT]"),
+        _ => bail!("usage: spoterm-engine login|run --cache DIR [--client-id ID --token FILE] \
+                    [--name N] [--bitrate 96|160|320] [--volume PCT] [--no-player]"),
     });
     if let Err(e) = result {
         eprintln!("spoterm-engine: {e:#}");
@@ -93,8 +103,15 @@ fn parse_args() -> Result<(String, Opts)> {
         name: "SpoTerm".into(),
         bitrate: Bitrate::Bitrate160,
         volume_pct: 50,
+        client_id: String::new(),
+        token: PathBuf::new(),
+        player: true,
     };
     while let Some(flag) = args.next() {
+        if flag == "--no-player" {
+            opts.player = false;
+            continue;
+        }
         let value = args.next().with_context(|| format!("{flag} needs a value"))?;
         match flag.as_str() {
             "--cache" => opts.cache = PathBuf::from(value),
@@ -107,6 +124,8 @@ fn parse_args() -> Result<(String, Opts)> {
                 }
             }
             "--volume" => opts.volume_pct = value.parse::<u8>().unwrap_or(50).min(100),
+            "--client-id" => opts.client_id = value,
+            "--token" => opts.token = PathBuf::from(value),
             _ => bail!("unknown option {flag}"),
         }
     }
@@ -117,8 +136,10 @@ fn parse_args() -> Result<(String, Opts)> {
 }
 
 fn runtime() -> Result<tokio::runtime::Runtime> {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
+    // One async thread is plenty (the player decodes on its own thread), and a small
+    // blocking pool keeps the thread count, and so memory, down.
+    tokio::runtime::Builder::new_current_thread()
+        .max_blocking_threads(4)
         .enable_all()
         .build()
         .context("start async runtime")
@@ -204,48 +225,80 @@ enum Cmd {
     Shuffle { on: bool },
     Repeat { mode: String },
     Activate,
-    Token {
-        #[serde(default)]
+    Api {
         id: u64,
+        #[serde(default = "get")]
+        method: String,
+        path: String,
+        #[serde(default)]
+        query: Option<serde_json::Map<String, Value>>,
+        #[serde(default)]
+        body: Option<Value>,
     },
     Quit,
+}
+
+fn get() -> String {
+    "GET".into()
 }
 
 fn run(o: Opts) -> Result<()> {
     runtime()?.block_on(async move {
         let (tx, rx) = unbounded_channel();
         tokio::spawn(writer(rx));
+        let web = Arc::new(web::Web::new(o.client_id.clone(), o.token.clone())?);
+        send(&tx, json!({"ev": "hello"}));
 
         let cache = open_cache(&o.cache)?;
-        if cache.credentials().is_none() {
-            login_needed(&tx, "not signed in").await;
-        }
         let mixer = Arc::new(SoftMixer::open(MixerConfig::default()).map_err(|e| anyhow!("mixer: {e}"))?);
         mixer.set_volume(cache.volume().unwrap_or(from_pct(o.volume_pct)));
+        let signed_in = o.player && cache.credentials().is_some();
+        drop(cache);
+        if o.player && !signed_in {
+            send(&tx, json!({"ev": "player", "state": "login"}));
+        }
 
-        let mut link = match connect(&o, &mixer, &tx).await {
-            Ok(link) => link,
-            Err(e) if is_credentials_error(&e) => {
-                let _ = std::fs::remove_file(o.cache.join("credentials.json"));
-                login_needed(&tx, "Spotify rejected the saved login").await;
-                unreachable!()
-            }
-            Err(e) => return Err(e),
-        };
-        send(&tx, json!({
-            "ev": "ready",
-            "device_id": link.session.device_id(),
-            "name": o.name,
-            "volume": to_pct(mixer.volume()),
-        }));
-
+        // The player connects in the background (a few seconds), so Web API calls are
+        // served from the first moment.
+        let mut link: Option<Link> = None;
+        let mut connecting = signed_in.then(|| Box::pin(connect(&o, &mixer, &tx)));
         let mut lines = BufReader::new(tokio::io::stdin()).lines();
         let mut health = tokio::time::interval(HEALTH_CHECK);
         health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let (mut backoff, mut retry_at) = (RETRY_MIN, Instant::now());
+        let mut player_ok = signed_in;
 
         loop {
             tokio::select! {
+                res = async { connecting.as_mut().unwrap().await }, if connecting.is_some() => {
+                    connecting = None;
+                    match res {
+                        Ok(fresh) => {
+                            let reconnect = link.is_some();
+                            if let Some(dead) = link.replace(fresh) {
+                                let _ = dead.spirc.shutdown();
+                            }
+                            let dev = link.as_ref().map(|l| l.session.device_id().to_string());
+                            backoff = RETRY_MIN;
+                            send(&tx, if reconnect {
+                                json!({"ev": "reconnected", "device_id": dev})
+                            } else {
+                                json!({"ev": "ready", "device_id": dev, "name": o.name, "volume": to_pct(mixer.volume())})
+                            });
+                        }
+                        Err(e) if is_credentials_error(&e) => {
+                            let _ = std::fs::remove_file(o.cache.join("credentials.json"));
+                            player_ok = false;
+                            send(&tx, json!({"ev": "player", "state": "login"}));
+                        }
+                        Err(e) => {
+                            log::warn!("player connect failed: {e:#}");
+                            send(&tx, json!({"ev": "player", "state": "retrying", "msg": format!("{e:#}")}));
+                            retry_at = Instant::now() + backoff;
+                            backoff = (backoff * 2).min(RETRY_MAX);
+                        }
+                    }
+                }
                 line = lines.next_line() => {
                     let Ok(Some(line)) = line else { break };   // EOF: SpoTerm has gone
                     if line.trim().is_empty() {
@@ -253,36 +306,41 @@ fn run(o: Opts) -> Result<()> {
                     }
                     match serde_json::from_str::<Cmd>(&line) {
                         Ok(Cmd::Quit) => break,
-                        Ok(cmd) => handle(&link, &mixer, &tx, cmd),
+                        Ok(Cmd::Api { id, method, path, query, body }) => {
+                            let (web, tx) = (web.clone(), tx.clone());
+                            tokio::spawn(async move {
+                                let v = match web.call(&method, &path, query, body).await {
+                                    Ok((status, body)) => json!({"ev": "api", "id": id, "status": status, "body": body}),
+                                    Err(f) => json!({"ev": "api", "id": id, "status": f.status, "error": f.msg,
+                                                     "body": f.body, "retry_after": f.retry_after}),
+                                };
+                                let _ = tx.send(v);
+                            });
+                        }
+                        Ok(cmd) => handle(link.as_ref(), &mixer, &tx, cmd),
                         Err(e) => send(&tx, json!({"ev": "error", "cmd": "parse", "msg": e.to_string()})),
                     }
                 }
-                _ = health.tick() => {
+                _ = health.tick(), if player_ok => {
                     // librespot invalidates the session when a keep-alive goes unanswered and
                     // leaves recovery to us, so rebuild it with backoff.
-                    if !link.session.is_invalid() || Instant::now() < retry_at {
+                    let dead = link.as_ref().is_none_or(|l| l.session.is_invalid());
+                    if !dead || connecting.is_some() || Instant::now() < retry_at {
                         continue;
                     }
-                    send(&tx, json!({"ev": "reconnecting"}));
-                    match connect(&o, &mixer, &tx).await {
-                        Ok(fresh) => {
-                            let dead = std::mem::replace(&mut link, fresh);
-                            let _ = dead.spirc.shutdown();
-                            backoff = RETRY_MIN;
-                            send(&tx, json!({"ev": "reconnected", "device_id": link.session.device_id()}));
-                        }
-                        Err(e) => {
-                            log::warn!("reconnect failed: {e:#}");
-                            retry_at = Instant::now() + backoff;
-                            backoff = (backoff * 2).min(RETRY_MAX);
-                        }
+                    if link.is_some() {
+                        send(&tx, json!({"ev": "reconnecting"}));
                     }
+                    connecting = Some(Box::pin(connect(&o, &mixer, &tx)));
                 }
             }
         }
-        let _ = link.spirc.shutdown();
-        link.player.stop();
-        tokio::time::sleep(Duration::from_millis(200)).await;   // let the device say goodbye
+        drop(connecting);
+        if let Some(link) = link {
+            let _ = link.spirc.shutdown();
+            link.player.stop();
+            tokio::time::sleep(Duration::from_millis(200)).await;   // let the device say goodbye
+        }
         Ok(())
     })
 }
@@ -296,8 +354,9 @@ async fn connect(o: &Opts, mixer: &Arc<SoftMixer>, tx: &Tx) -> Result<Link> {
         bitrate: o.bitrate,
         ..Default::default()   // no periodic position events: SpoTerm interpolates locally
     };
+    let sink_tx = tx.clone();
     let player = Player::new(config, session.clone(), mixer.get_soft_volume(), move || {
-        backend(None, AudioFormat::default())
+        Box::new(LazySink { backend, sink: None, tx: sink_tx }) as Box<dyn Sink>
     });
 
     let mut events = player.get_player_event_channel();
@@ -327,18 +386,64 @@ async fn connect(o: &Opts, mixer: &Arc<SoftMixer>, tx: &Tx) -> Result<Link> {
     Ok(Link { spirc, player, session })
 }
 
+/// Opens the sound device only while audio plays. rodio keeps its output stream, and the
+/// OS audio callback thread behind it, running for as long as the sink exists, which costs
+/// CPU even when paused; so the real sink is dropped whenever librespot stops it. Opening
+/// also can't take the engine down: rodio panics when there is no output device, and that
+/// becomes a normal error (librespot then pauses) plus a message for the UI.
+struct LazySink {
+    backend: SinkBuilder,
+    sink: Option<Box<dyn Sink>>,
+    tx: Tx,
+}
+
+impl LazySink {
+    fn open(&mut self) -> SinkResult<&mut Box<dyn Sink>> {
+        if self.sink.is_none() {
+            let backend = self.backend;
+            let opened = std::panic::catch_unwind(|| backend(None, AudioFormat::default()));
+            match opened {
+                Ok(sink) => self.sink = Some(sink),
+                Err(_) => {
+                    send(&self.tx, json!({"ev": "error", "cmd": "audio", "msg": "no audio output device available"}));
+                    return Err(SinkError::ConnectionRefused("no audio output device".into()));
+                }
+            }
+        }
+        Ok(self.sink.as_mut().expect("just opened"))
+    }
+}
+
+impl Sink for LazySink {
+    fn start(&mut self) -> SinkResult<()> {
+        self.open()?.start()
+    }
+
+    fn stop(&mut self) -> SinkResult<()> {
+        // librespot exits the process if stop fails, so never report an error here.
+        if let Some(mut sink) = self.sink.take() {
+            if let Err(e) = sink.stop() {
+                log::warn!("audio stop: {e}");
+            }
+        }
+        Ok(())
+    }
+
+    fn write(&mut self, packet: AudioPacket, converter: &mut Converter) -> SinkResult<()> {
+        self.open()?.write(packet, converter)
+    }
+}
+
 fn is_credentials_error(e: &anyhow::Error) -> bool {
     let s = format!("{e:#}");
     s.contains("INVALID_CREDENTIALS") || s.contains("BadCredentials") || s.contains("Bad credentials")
 }
 
-async fn login_needed(tx: &Tx, why: &str) {
-    send(tx, json!({"ev": "error", "kind": "login", "msg": why}));
-    tokio::time::sleep(Duration::from_millis(100)).await;   // let the writer flush
-    std::process::exit(EXIT_LOGIN);
-}
-
-fn handle(link: &Link, mixer: &Arc<SoftMixer>, tx: &Tx, cmd: Cmd) {
+fn handle(link: Option<&Link>, mixer: &Arc<SoftMixer>, tx: &Tx, cmd: Cmd) {
+    let Some(link) = link else {
+        send(tx, json!({"ev": "error", "cmd": "player", "msg": "SpoTerm's player isn't connected yet"}));
+        return;
+    };
     let spirc = &link.spirc;
     // Spotify revokes the active role from an idle device, after which librespot drops
     // every command except Activate; it no-ops when we're already active.
@@ -390,23 +495,7 @@ fn handle(link: &Link, mixer: &Arc<SoftMixer>, tx: &Tx, cmd: Cmd) {
             ("repeat", r)
         }
         Cmd::Activate => ("activate", spirc.activate()),
-        Cmd::Token { id } => {
-            let session = link.session.clone();
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                let got = tokio::time::timeout(Duration::from_secs(10), session.login5().auth_token()).await;
-                let v = match got {
-                    Ok(Ok(t)) => json!({
-                        "ev": "token", "id": id, "access_token": t.access_token,
-                        "expires_in": t.expires_in.as_secs(), "scopes": t.scopes,
-                    }),
-                    Ok(Err(e)) => json!({"ev": "token", "id": id, "error": e.to_string()}),
-                    Err(_) => json!({"ev": "token", "id": id, "error": "timed out"}),
-                };
-                let _ = tx.send(v);
-            });
-            return;
-        }
+        Cmd::Api { .. } => return,
         Cmd::Quit => return,
     };
     if let Err(e) = result {

@@ -107,7 +107,7 @@ def width(s: str) -> int:
     return len(s) if s.isascii() else sum(_cw(c) for c in s)
 
 
-@lru_cache(maxsize=4096)
+@lru_cache(maxsize=1024)
 def fit(s: str, w: int, ell: str = "…", right: bool = False) -> str:
     """Pad or truncate s to exactly w terminal columns."""
     if w <= 0:

@@ -2436,6 +2436,7 @@ dependencies = [
  "librespot-oauth",
  "librespot-playback",
  "log",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",

@@ -1,181 +1,133 @@
-"""SpoTerm's own playback device: the `spoterm-engine` helper (librespot, in Rust).
+"""SpoTerm's engine: the `spoterm-engine` helper process (Rust, librespot).
 
-The helper is a Spotify Connect player driven over pipes. SpoTerm writes one JSON
-command per line to its stdin and it answers with one JSON event per line on
-stdout. Commands never touch the network on our side, so play, pause, seek and
-volume act instantly, and player state is pushed to us, so there is nothing to poll.
+It does the two heavy jobs so this Python process stays tiny:
 
-A reader thread blocks on the pipe and queues events for the UI thread; it costs
-nothing while idle. The helper dies with SpoTerm: its stdin closes when we exit,
-and on Windows a Job Object kills it even if SpoTerm crashes.
+* plays audio as the "SpoTerm" Spotify Connect device, and
+* makes every Web API call over its own HTTPS stack (so Python never loads TLS).
+
+We write one JSON command per line to its stdin; it answers with one JSON event per
+line on stdout. A reader thread blocks on the pipe and costs nothing while idle:
+player events go to `events` for the UI thread, API answers wake the worker thread
+that asked. The helper exits when its stdin closes, which the OS does when SpoTerm
+exits for any reason, crashes included.
 """
 
-import atexit
 import json
 import os
 import queue
-import shutil
 import subprocess
 import sys
 import threading
-from pathlib import Path
 
 from . import config
 
 _WIN = sys.platform == "win32"
 EXE = "spoterm-engine.exe" if _WIN else "spoterm-engine"
-EXIT_LOGIN = 3
 STOP_TIMEOUT = 1.5
+CALL_TIMEOUT = 40.0     # the engine itself gives up on a request well before this
 
 
 def find_binary(explicit: str = "") -> str | None:
     """SPOTERM_ENGINE_BIN, then the project's own build, then <config_dir>/bin, then PATH."""
     if explicit:
-        return explicit if Path(explicit).is_file() else None
-    for p in (config.PROJECT_DIR / "engine" / "target" / "release" / EXE, config.config_dir() / "bin" / EXE):
-        if p.is_file():
-            return str(p)
-    return shutil.which("spoterm-engine")
-
-
-class _KillOnCloseJob:
-    """A Windows Job Object that kills its processes when the last handle to it closes,
-    which the OS does when SpoTerm exits for any reason, crashes included."""
-
-    def __init__(self):
-        import ctypes
-        from ctypes import wintypes
-
-        class Basic(ctypes.Structure):
-            _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64),
-                        ("PerJobUserTimeLimit", ctypes.c_int64),
-                        ("LimitFlags", wintypes.DWORD),
-                        ("MinimumWorkingSetSize", ctypes.c_size_t),
-                        ("MaximumWorkingSetSize", ctypes.c_size_t),
-                        ("ActiveProcessLimit", wintypes.DWORD),
-                        ("Affinity", ctypes.c_size_t),
-                        ("PriorityClass", wintypes.DWORD),
-                        ("SchedulingClass", wintypes.DWORD)]
-
-        class IoCounters(ctypes.Structure):
-            _fields_ = [(n, ctypes.c_uint64) for n in (
-                "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
-                "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
-
-        class Extended(ctypes.Structure):
-            _fields_ = [("BasicLimitInformation", Basic),
-                        ("IoInfo", IoCounters),
-                        ("ProcessMemoryLimit", ctypes.c_size_t),
-                        ("JobMemoryLimit", ctypes.c_size_t),
-                        ("PeakProcessMemoryUsed", ctypes.c_size_t),
-                        ("PeakJobMemoryUsed", ctypes.c_size_t)]
-
-        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        k32.CreateJobObjectW.restype = wintypes.HANDLE
-        k32.CreateJobObjectW.argtypes = (wintypes.LPVOID, wintypes.LPCWSTR)
-        k32.SetInformationJobObject.argtypes = (wintypes.HANDLE, ctypes.c_int,
-                                                wintypes.LPVOID, wintypes.DWORD)
-        k32.AssignProcessToJobObject.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
-        self._k32 = k32
-        self.handle = k32.CreateJobObjectW(None, None)
-        if not self.handle:
-            raise ctypes.WinError(ctypes.get_last_error())
-        info = Extended()
-        info.BasicLimitInformation.LimitFlags = 0x2000     # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-        if not k32.SetInformationJobObject(self.handle, 9,  # JobObjectExtendedLimitInformation
-                                           ctypes.byref(info), ctypes.sizeof(info)):
-            raise ctypes.WinError(ctypes.get_last_error())
-
-    def assign(self, proc: subprocess.Popen) -> bool:
-        return bool(self._k32.AssignProcessToJobObject(self.handle, int(proc._handle)))
+        return explicit if os.path.isfile(explicit) else None
+    for folder in (os.path.join(config.PROJECT_DIR, "engine", "target", "release"),
+                   os.path.join(config.config_dir(), "bin"),
+                   *os.environ.get("PATH", "").split(os.pathsep)):
+        path = os.path.join(folder, EXE)
+        if folder and os.path.isfile(path):
+            return path
+    return None
 
 
 class Engine:
     def __init__(self, settings: config.Settings):
         self.name = settings.engine_name
-        self.enabled = settings.engine
+        self.player_enabled = settings.engine
         self.bitrate = settings.engine_bitrate
-        self.binary = find_binary(settings.engine_bin) if self.enabled else None
-        self.cache_dir = config.config_dir() / "engine"
-        self.log_path = config.config_dir() / "engine.log"
-        self.events: queue.SimpleQueue = queue.SimpleQueue()   # drained by the UI thread
+        self.client_id = settings.client_id
+        self.token_path = settings.token_path
+        self.binary = find_binary(settings.engine_bin)
+        self.cache_dir = os.path.join(config.config_dir(), "engine")
+        self.log_path = os.path.join(config.config_dir(), "engine.log")
+        self.events: queue.SimpleQueue = queue.SimpleQueue()   # player events, for the UI thread
         self.device_id: str | None = None
-        self.ready = False
+        self.ready = False             # the player is connected
+        self.player_state = ""         # "", "login", "retrying"
+        self.alive = threading.Event() # the helper said hello: API calls can flow
         self._proc: subprocess.Popen | None = None
         self._wlock = threading.Lock()
-        self._job = None
+        self._calls: dict = {}         # id -> [threading.Event, answer]
+        self._next_id = 0
         self._exit_code: int | None = None
-        self._login_needed = False
-        atexit.register(self.stop)
+        self._stopping = False
 
     # ── State ────────────────────────────────────────────────────────────────
     def available(self) -> bool:
-        return bool(self.enabled and self.binary)
+        return self.binary is not None
 
     def needs_login(self) -> bool:
-        return self._login_needed or not (self.cache_dir / "credentials.json").is_file()
+        """Whether the player (not SpoTerm's own sign-in) still needs its one-time login."""
+        return self.player_enabled and (
+            self.player_state == "login"
+            or not os.path.isfile(os.path.join(self.cache_dir, "credentials.json")))
 
     def running(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
 
     @property
     def status(self) -> str:
-        """"off", "not built", "login needed", "starting", "ready", or "stopped (N)"."""
-        if not self.enabled:
+        """"off", "not built", "login needed", "starting", "retrying", "ready" or "stopped (N)"."""
+        if not self.player_enabled:
             return "off"
         if not self.binary:
             return "not built"
-        if self._login_needed:
+        if self.player_state == "login":
             return "login needed"
         if self.running():
-            return "ready" if self.ready else "starting"
+            if self.ready:
+                return "ready"
+            return "retrying" if self.player_state == "retrying" else "starting"
         if self._exit_code is not None:
             return f"stopped ({self._exit_code})"
-        return "starting" if self._proc is None else "stopped"
+        return "starting"
 
     # ── Login (before curses) ────────────────────────────────────────────────
     def login(self) -> bool:
         """One-time browser sign-in for the player. Blocking; prints to the terminal."""
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-        print("Signing in SpoTerm's built-in player. Your browser will open; "
-              "approve it and come back here (ctrl+c to skip).")
+        os.makedirs(self.cache_dir, exist_ok=True)
+        print("Signing in SpoTerm's player. Your browser will open: approve it, then come "
+              "back here (ctrl+c skips this; SpoTerm then only controls other devices).")
         try:
-            code = subprocess.call([self.binary, "login", "--cache", str(self.cache_dir)],
-                                   env=self._env())
+            code = subprocess.call([self.binary, "login", "--cache", self.cache_dir], env=self._env())
         except KeyboardInterrupt:
-            print("\nSkipped. SpoTerm will only control other Spotify devices this time.")
+            print("\nSkipped.")
+            return False
+        except OSError as e:
+            print(f"Couldn't run the player: {e}")
             return False
         if code != 0:
-            print(f"Player sign-in failed (exit {code}). Details: {self.log_path}")
+            print(f"Player sign-in didn't finish (exit {code}).")
             return False
-        self._login_needed = False
+        self.player_state = ""
         return True
 
     # ── Process ──────────────────────────────────────────────────────────────
     def start(self) -> None:
-        if not self.available() or self.running() or self.needs_login():
+        if not self.binary or self.running() or self._stopping:
             return
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-        argv = [self.binary, "run", "--cache", str(self.cache_dir), "--name", self.name,
-                "--bitrate", str(self.bitrate)]
-        log = open(self.log_path, "wb")          # the child keeps its own handle
-        kwargs = {}
-        if _WIN:
-            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-        else:
-            kwargs["start_new_session"] = True
-        try:
+        os.makedirs(self.cache_dir, exist_ok=True)
+        argv = [self.binary, "run", "--cache", self.cache_dir, "--name", self.name,
+                "--bitrate", str(self.bitrate), "--client-id", self.client_id,
+                "--token", self.token_path]
+        if self.needs_login() or not self.player_enabled:
+            argv.append("--no-player")
+        kwargs = {"creationflags": subprocess.CREATE_NO_WINDOW} if _WIN else {"start_new_session": True}
+        with open(self.log_path, "wb") as log:     # the child keeps its own handle
             self._proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                           stderr=log, env=self._env(), bufsize=0, **kwargs)
-        finally:
-            log.close()
         self.ready, self.device_id, self._exit_code = False, None, None
-        if _WIN:
-            try:
-                self._job = self._job or _KillOnCloseJob()
-                self._job.assign(self._proc)
-            except OSError:
-                pass   # stdin EOF still stops it when SpoTerm exits normally
+        self.alive.clear()
         threading.Thread(target=self._read, args=(self._proc,), name="spoterm-engine",
                          daemon=True).start()
 
@@ -186,45 +138,123 @@ class Engine:
         return env
 
     def _read(self, proc: subprocess.Popen) -> None:
-        for raw in proc.stdout:   # blocks in the OS until the helper writes; no polling
-            try:
-                ev = json.loads(raw)
-            except ValueError:
-                continue
-            if not isinstance(ev, dict):
-                continue
-            kind = ev.get("ev")
-            if kind == "ready":
-                self.ready, self.device_id = True, ev.get("device_id")
-            elif kind == "reconnected":
-                self.device_id = ev.get("device_id") or self.device_id
-            elif kind == "error" and ev.get("kind") == "login":
-                self._login_needed = True
-            self.events.put(ev)
+        try:
+            for raw in proc.stdout:   # blocks in the OS until the helper writes; no polling
+                try:
+                    ev = json.loads(raw)
+                except (ValueError, RecursionError):
+                    continue
+                if isinstance(ev, dict) and proc is self._proc:
+                    self._dispatch(ev)
+        except (OSError, ValueError):
+            pass
         code = proc.wait()
+        if self._proc is not proc:
+            return      # stopped on purpose (stop() already reset everything) or replaced
         self.ready = False
+        self.alive.clear()
         self._exit_code = code
-        if code == EXIT_LOGIN:
-            self._login_needed = True
-        self.events.put({"ev": "exit", "code": code})
+        self._fail_calls("SpoTerm's engine stopped")
+        if not self._stopping:
+            self.events.put({"ev": "exit", "code": code})
 
-    def send(self, cmd: str, **args) -> bool:
-        """Queue a command for the player. Never blocks on the network."""
+    def _dispatch(self, ev: dict) -> None:
+        kind = ev.get("ev")
+        if kind == "api":
+            slot = self._calls.pop(ev.get("id"), None)
+            if slot:
+                slot[1] = ev
+                slot[0].set()
+            return
+        if kind == "hello":
+            self.alive.set()
+            return
+        dev = ev.get("device_id") if isinstance(ev.get("device_id"), str) else None
+        if kind == "ready":
+            self.ready, self.device_id, self.player_state = True, dev, ""
+        elif kind == "reconnected":
+            self.device_id = dev or self.device_id
+        elif kind == "player":
+            state = ev.get("state")
+            self.player_state = state if state in ("login", "retrying") else ""
+        self.events.put(ev)
+
+    def _fail_calls(self, why: str) -> None:
+        calls, self._calls = self._calls, {}
+        for slot in calls.values():
+            slot[1] = {"ev": "api", "status": 0, "error": why}
+            slot[0].set()
+
+    def _write(self, obj: dict) -> bool:
         proc = self._proc
-        if not proc or proc.poll() is not None or not self.ready:
+        if not proc or proc.poll() is not None:
             return False
-        line = (json.dumps({"cmd": cmd, **args}, separators=(",", ":")) + "\n").encode()
+        line = (json.dumps(obj, separators=(",", ":")) + "\n").encode()
         with self._wlock:
             try:
                 proc.stdin.write(line)
                 proc.stdin.flush()
-            except OSError:
+            except (OSError, ValueError):
                 return False
         return True
 
+    def send(self, cmd: str, **args) -> bool:
+        """Queue a player command. Never blocks on the network."""
+        return self.ready and self._write({"cmd": cmd, **args})
+
+    def call(self, method: str, path: str, query: dict | None = None, body=None):
+        """A Web API call made by the engine. Blocks (on a worker thread) until it answers."""
+        from .api import ApiError
+        if not self._wait_alive(10):
+            raise ApiError(0, "SpoTerm's engine isn't running")
+        with self._wlock:
+            self._next_id += 1
+            cid = self._next_id
+        slot = [threading.Event(), None]
+        self._calls[cid] = slot
+        if not self._write({"cmd": "api", "id": cid, "method": method, "path": path,
+                            "query": query or None, "body": body}):
+            self._calls.pop(cid, None)
+            raise ApiError(0, "SpoTerm's engine isn't running")
+        if not slot[0].wait(CALL_TIMEOUT):
+            self._calls.pop(cid, None)
+            raise TimeoutError()
+        ev = slot[1]
+        status = ev.get("status") if isinstance(ev.get("status"), int) else 0
+        if "error" in ev or status >= 400 or status <= 0:
+            b = ev.get("body")
+            ra = ev.get("retry_after")
+            raise ApiError(status, str(ev.get("error") or ""),
+                           retry_after=float(ra) if isinstance(ra, (int, float)) and 0 <= ra < 86400 else 0.0,
+                           login=isinstance(b, dict) and bool(b.get("login")))
+        return ev.get("body")
+
+    def _wait_alive(self, timeout: float) -> bool:
+        """Wait for the helper's hello, giving up at once if it has already exited."""
+        for _ in range(int(timeout / 0.25)):
+            if self.alive.wait(0.25):
+                return True
+            if self._proc is not None and self._proc.poll() is not None:
+                return False
+        return self.alive.is_set()
+
+    def check_web(self) -> str:
+        """Check SpoTerm's own sign-in before the UI starts: "ok", "login" or an error text."""
+        from .api import ApiError
+        try:
+            self.call("GET", "me")
+            return "ok"
+        except ApiError as e:
+            return "login" if e.login else (e.message or f"HTTP {e.status}")
+        except TimeoutError:
+            return "Spotify took too long to respond"
+
     def stop(self) -> None:
-        self.enabled = False   # nothing may respawn it after this
+        self._stopping = True          # nothing may respawn it after this
         proc, self._proc = self._proc, None
+        self.ready = False
+        self.alive.clear()
+        self._fail_calls("SpoTerm's engine stopped")
         if not proc or proc.poll() is not None:
             return
         try:
@@ -232,5 +262,12 @@ class Engine:
                 proc.stdin.write(b'{"cmd":"quit"}\n')
                 proc.stdin.close()
             proc.wait(STOP_TIMEOUT)
-        except (OSError, subprocess.TimeoutExpired):
+        except (OSError, ValueError, subprocess.TimeoutExpired):
             proc.kill()
+
+    def restart(self) -> None:
+        """Stop and start again, e.g. after a sign-in so the new login is picked up."""
+        self.stop()
+        self._stopping = False
+        self.player_state = ""
+        self.start()

@@ -2,10 +2,10 @@
 
 import os
 import sys
-from dataclasses import dataclass
-from pathlib import Path
 
-PROJECT_DIR = Path(__file__).resolve().parent.parent
+# Plain os.path and a plain class on purpose: pathlib and dataclasses pull in a dozen
+# more stdlib modules, and memory is a feature here.
+PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 SCOPE = " ".join((
     "user-read-playback-state",
@@ -19,25 +19,30 @@ SCOPE = " ".join((
 ))
 
 
-def config_dir() -> Path:
+def config_dir() -> str:
     # Not %APPDATA% on Windows: Microsoft Store Python silently redirects writes there to a
     # private per-package folder, so the engine (a separate program) and the user would
     # look in the wrong place. The home folder is never redirected.
     base = os.environ.get("XDG_CONFIG_HOME") if sys.platform != "win32" else None
-    return Path(base or Path.home() / ".config") / "spoterm"
+    return os.path.join(base or os.path.join(os.path.expanduser("~"), ".config"), "spoterm")
 
 
-@dataclass(frozen=True)
 class Settings:
-    client_id: str
-    client_secret: str         # optional: "" means PKCE-only (the usual case)
-    redirect_uri: str
-    token_path: Path
-    ascii: bool
-    engine: bool = True        # run librespot as SpoTerm's own playback device
-    engine_name: str = "SpoTerm"
-    engine_bitrate: int = 160  # 96 | 160 | 320; lower is lighter on CPU and network
-    engine_bin: str = ""       # explicit path to the spoterm-engine binary
+    __slots__ = ("client_id", "client_secret", "redirect_uri", "token_path", "ascii",
+                 "engine", "engine_name", "engine_bitrate", "engine_bin")
+
+    def __init__(self, client_id: str, client_secret: str, redirect_uri: str, token_path: str,
+                 ascii: bool, engine: bool = True, engine_name: str = "SpoTerm",
+                 engine_bitrate: int = 160, engine_bin: str = ""):
+        self.client_id = client_id
+        self.client_secret = client_secret   # optional: "" means PKCE-only (the usual case)
+        self.redirect_uri = redirect_uri
+        self.token_path = token_path
+        self.ascii = ascii
+        self.engine = engine                 # play audio here (off: remote control only)
+        self.engine_name = engine_name
+        self.engine_bitrate = engine_bitrate # 96 | 160 | 320; lower is lighter on CPU and network
+        self.engine_bin = engine_bin         # explicit path to the spoterm-engine binary
 
 
 class ConfigError(Exception):
@@ -100,9 +105,10 @@ _ENV_KEYS = frozenset(("HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy"))
 
 def _load_env_files() -> None:
     # Real environment variables win; then the first .env that defines a key.
-    for path in (Path.cwd() / ".env", PROJECT_DIR / ".env", config_dir() / ".env"):
+    for folder in (os.getcwd(), PROJECT_DIR, config_dir()):
         try:
-            text = path.read_text(encoding="utf-8-sig")
+            with open(os.path.join(folder, ".env"), encoding="utf-8-sig") as f:
+                text = f.read()
         except (OSError, UnicodeDecodeError):
             continue
         for k, v in parse_env(text).items():
@@ -110,13 +116,14 @@ def _load_env_files() -> None:
                 os.environ.setdefault(k, v)
 
 
-def _migrate_token(token_path: Path) -> None:
+def _migrate_token(token_path: str) -> None:
     """Carry the login over from the old %APPDATA% location, so moving folders isn't a re-login."""
-    old = Path(os.environ.get("APPDATA") or "") / "spoterm" / "token.json"
-    if sys.platform != "win32" or token_path.exists() or not old.is_file():
+    old = os.path.join(os.environ.get("APPDATA") or "", "spoterm", "token.json")
+    if sys.platform != "win32" or os.path.exists(token_path) or not os.path.isfile(old):
         return
     try:
-        token_path.write_bytes(old.read_bytes())
+        with open(old, "rb") as src, open(token_path, "wb") as dst:
+            dst.write(src.read())
     except OSError:
         pass
 
@@ -128,7 +135,7 @@ def _flag(name: str, default: bool) -> bool:
 
 def load() -> Settings:
     _load_env_files()
-    config_dir().mkdir(mode=0o700, parents=True, exist_ok=True)   # token, logs and the engine's login live here
+    os.makedirs(config_dir(), mode=0o700, exist_ok=True)   # token, logs and the engine's login live here
 
     client_id = os.getenv("SPOTIPY_CLIENT_ID", "").strip()
     if not client_id:
@@ -138,8 +145,8 @@ def load() -> Settings:
             "(from your app at https://developer.spotify.com/dashboard)."
         )
 
-    token_path = Path(os.getenv("SPOTERM_TOKEN_PATH") or config_dir() / "token.json")
-    token_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    token_path = os.getenv("SPOTERM_TOKEN_PATH") or os.path.join(config_dir(), "token.json")
+    os.makedirs(os.path.dirname(os.path.abspath(token_path)), mode=0o700, exist_ok=True)
     _migrate_token(token_path)
 
     bitrate = os.getenv("SPOTERM_BITRATE", "").strip()

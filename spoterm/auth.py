@@ -51,7 +51,8 @@ class Token:
                 "scope": self.scope, "pkce": self.pkce}
 
 
-def _read_token(path: Path) -> Token | None:
+def _read_token(path) -> Token | None:
+    path = Path(path)
     try:
         d = json.loads(path.read_text(encoding="utf-8"))
         return Token(str(d["access_token"]), str(d.get("refresh_token") or ""),
@@ -61,10 +62,11 @@ def _read_token(path: Path) -> Token | None:
         return None
 
 
-def _write_token(path: Path, token: Token) -> None:
+def _write_token(path, token: Token) -> None:
     """Atomic write, owner-only. mkstemp creates the file 0600 on POSIX; on Windows it
     inherits the ACL of the per-user %APPDATA% folder."""
     import tempfile
+    path = Path(path)
     fd, tmp = tempfile.mkstemp(prefix=".token-", suffix=".tmp", dir=path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
