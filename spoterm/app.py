@@ -46,6 +46,24 @@ PADENTER = getattr(curses, "PADENTER", -999)
 BACKSPACE = (curses.KEY_BACKSPACE, "\b", "\x7f", "\x08")
 
 
+class Echo:
+    """Remembers the last value we asked the engine for, so late echoes of earlier presses
+    (volume 55, then 60, while you're already at 65) don't make the display jump back.
+    While a change is pending, only an echo of that exact value is shown, whatever order
+    the echoes arrive in. Outside the short window everything is shown as is, since it
+    came from elsewhere (e.g. your phone)."""
+    __slots__ = ("target", "until")
+
+    def __init__(self):
+        self.target, self.until = None, 0.0
+
+    def sent(self, now: float, value) -> None:
+        self.target, self.until = value, now + 1.5
+
+    def accept(self, now: float, value) -> bool:
+        return now >= self.until or value == self.target
+
+
 class TrackList:
     # A plain __slots__ class: dataclasses would pull inspect, ast and tokenize into memory.
     __slots__ = ("key", "kind", "title", "context_uri", "playlist_id", "query", "tracks", "total",
@@ -191,6 +209,18 @@ class App:
         self.engine_volume: int | None = None
         self.restarts: list = []                # recent engine restart times
         self.restart_at = 0.0
+        # After a local play: ignore the engine's late events for anything but this track,
+        # and ignore Spotify still naming the previous device, for a moment.
+        self.expect_uri: str | None = None
+        self.expect_name = ""
+        self.expect_deadline = 0.0
+        self.local_grace_until = 0.0
+        self.vol_echo, self.shuffle_echo, self.repeat_echo = Echo(), Echo(), Echo()
+        self.play_echo, self.seek_echo = Echo(), Echo()
+        self.remote_expect: tuple | None = None     # (uri, name, deadline) after a remote play
+        # Changes made on a remote device, shown until Spotify reports them (it lags):
+        # field -> (value, deadline).
+        self.holds: dict = {}
         self.user_id: str | None = None
 
         # library
@@ -279,6 +309,8 @@ class App:
             pb = Playback(old.track if old else None, False, 0, now, eng.device_id, eng.name,
                           old.volume if old else self.engine_volume, False, "off", None)
             self.pb, self.local = pb, True
+            self.holds.clear()
+            self.remote_expect = None
             self.next_poll = float("inf")   # events keep us current: stop polling
         return pb
 
@@ -325,10 +357,15 @@ class App:
             self.flash("Reconnected")
             return
         if kind == "active":
-            if not ev.get("on") and self.local:
+            if not ev.get("on") and self.local and now >= self.local_grace_until:
                 self.poll_soon(0)       # playback may have moved to another device
             return
         if kind in ("volume", "shuffle", "repeat"):
+            echo, value = {"volume": (self.vol_echo, min(100, num("pct"))),
+                           "shuffle": (self.shuffle_echo, ev.get("on") is True),
+                           "repeat": (self.repeat_echo, text("mode", "off"))}[kind]
+            if not echo.accept(now, value):
+                return                  # an echo of an earlier press; ours is on its way
             if kind == "volume":
                 self.engine_volume = min(100, num("pct"))
             if not self.local or self.pb is None:
@@ -341,11 +378,29 @@ class App:
                 mode = text("mode", "off")
                 self.pb.repeat = mode if mode in ("off", "context", "track") else "off"
             return
+        if kind not in ("track", "playing", "paused", "loading", "pos", "stopped", "end", "unavailable"):
+            return
+
+        # Just after you pick a track, the engine is still reporting on the one before it
+        # (stopped, paused, even "track" for it). Only the track you picked may update the
+        # screen, until it shows up or the wait times out.
+        uri = text("uri")
+        if self.expect_uri:
+            if now >= self.expect_deadline:
+                self.expect_uri = None
+            elif kind == "track" and (uri == self.expect_uri or text("name") == self.expect_name):
+                self.expect_uri = None      # Spotify may relink to a regional copy: same name
+            elif kind == "unavailable" and uri == self.expect_uri:
+                self.expect_uri = None
+            elif uri != self.expect_uri or kind not in ("loading", "playing"):
+                return      # includes stopped/paused left over from replaying the same track
         if kind == "unavailable":
-            self.flash("That track isn't available", warn=True)
+            self.flash("That track isn't available here, skipping", warn=True)
             return
-        if kind not in ("track", "playing", "paused", "loading", "pos", "stopped", "end"):
-            return
+        if kind in ("playing", "paused") and not self.play_echo.accept(now, kind == "playing"):
+            return                      # echo of an earlier play/pause press
+        if kind == "pos" and not self.seek_echo.accept(now, num("pos")):
+            return                      # echo of an earlier seek
 
         pb = self._local_pb(now)
         if kind == "track":
@@ -362,7 +417,8 @@ class App:
         elif kind == "stopped":
             pb.rebase(now)
             pb.is_playing = False
-            self.poll_soon(0)           # stopped often means another device took over
+            if now >= self.local_grace_until:
+                self.poll_soon(0)       # stopped often means another device took over
 
     def track_changed(self, track: Track | None) -> None:
         """Reset the like flag for a new current track and look it up."""
@@ -402,12 +458,27 @@ class App:
             if pb is None or (eng_id and pb.device_id == eng_id):
                 self.next_poll = float("inf")   # still ours: the engine's events are fresher
                 return
+            if now < self.local_grace_until:
+                # Spotify takes a few seconds to notice we took over; ask again after that.
+                self.next_poll = self.local_grace_until + 0.5
+                return
             self.local = False                  # playback moved to another device
+        exp = self.remote_expect
+        if exp and pb and pb.track:
+            if pb.track.uri == exp[0] or pb.track.name == exp[1] or now >= exp[2]:
+                self.remote_expect = None
+            else:
+                self.next_poll = now + 0.7      # still the previous track: Spotify is lagging
+                return
         if pb and self.vol_target is not None:
             pb.volume = self.vol_target
+        pending = bool(pb and self.holds and self.apply_holds(pb, now))
         self.pb = pb
         track = pb.track if pb else None
         self.track_changed(track)
+        if pending:
+            self.next_poll = now + 0.7          # re-check soon until Spotify catches up
+            return
 
         if self.burst > 0:
             self.burst -= 1
@@ -420,6 +491,33 @@ class App:
         else:
             delay = POLL_IDLE
         self.next_poll = now + delay
+
+    def hold(self, field: str, value, secs: float = 4.0) -> None:
+        """Keep showing a change made on a remote device until Spotify confirms it."""
+        if not self.local:
+            self.holds[field] = (value, time.monotonic() + secs)
+
+    def apply_holds(self, pb: Playback, now: float) -> bool:
+        """Overlay unconfirmed remote changes on a poll result. True if any are still pending."""
+        pending = False
+        for field, (value, deadline) in list(self.holds.items()):
+            if field == "progress":
+                got = pb.progress(now)
+                want = value + (int((now - (deadline - 4.0)) * 1000) if pb.is_playing else 0)
+                confirmed = abs(got - want) < 3000
+            else:
+                confirmed = getattr(pb, field) == value
+            if confirmed or now >= deadline:
+                del self.holds[field]
+                continue
+            pending = True
+            if field == "progress":
+                old = self.pb
+                pb.progress_ms = old.progress(now) if old else value
+                pb.fetched_at = now
+            else:
+                setattr(pb, field, value)
+        return pending
 
     def on_poll_error(self, err: BaseException) -> None:
         self.poll_inflight = False
@@ -453,13 +551,21 @@ class App:
             pb.rebase(now)
         if pb and pb.is_playing:
             pb.is_playing = False
-            self.send("pause") or self.command(self.api.pause)
+            if self.send("pause"):
+                self.play_echo.sent(now, False)
+            else:
+                self.hold("is_playing", False)
+                self.command(self.api.pause)
         elif (not pb or not pb.device_id) and self.engine_can_play():
             self.play_selected()        # nothing to resume anywhere: play the highlighted track here
         else:
             if pb and pb.track:
                 pb.is_playing = True
-            self.send("play") or self.command(self.api.resume)
+            if self.send("play"):
+                self.play_echo.sent(now, True)
+            else:
+                self.hold("is_playing", True)
+                self.command(self.api.resume)
         self.dirty = True
 
     def engine_can_play(self) -> bool:
@@ -481,9 +587,12 @@ class App:
         pos = max(0, min(pb.progress(now) + delta_ms, pb.track.duration_ms - 1000))
         pb.progress_ms, pb.fetched_at = pos, now
         self.dirty = True
+        self.cmd_seq += 1   # a poll already in flight predates this seek: don't let it snap back
         if self.send("seek", ms=pos):
+            self.seek_echo.sent(now, pos)
             return
         self.seek_target, self.seek_deadline = pos, now + 0.3   # debounce held keys into one request
+        self.hold("progress", pos)
 
     def change_volume(self, delta: int) -> None:
         pb = self.pb
@@ -497,6 +606,7 @@ class App:
         self.dirty = True
         if self.send("volume", pct=self.vol_target):
             self.vol_target = None                    # local: applied instantly, no debounce
+            self.vol_echo.sent(time.monotonic(), pb.volume)
             return
         self.vol_deadline = time.monotonic() + 0.25   # debounce key repeats into one request
 
@@ -506,6 +616,7 @@ class App:
         def done(_):
             if self.vol_target == v:
                 self.vol_target = None
+                self.hold("volume", v)
 
         def fail(err):
             self.vol_target = None
@@ -523,7 +634,10 @@ class App:
         if not self.pb:
             return
         self.pb.shuffle = on = not self.pb.shuffle
-        if not self.send("shuffle", on=on):
+        if self.send("shuffle", on=on):
+            self.shuffle_echo.sent(time.monotonic(), on)
+        else:
+            self.hold("shuffle", on)
             self.command(lambda: self.api.shuffle(on))
         self.dirty = True
 
@@ -532,7 +646,10 @@ class App:
             return
         nxt = {"off": "context", "context": "track"}.get(self.pb.repeat, "off")
         self.pb.repeat = nxt
-        if not self.send("repeat", mode=nxt):
+        if self.send("repeat", mode=nxt):
+            self.repeat_echo.sent(time.monotonic(), nxt)
+        else:
+            self.hold("repeat", nxt)
             self.command(lambda: self.api.repeat(nxt))
         self.dirty = True
 
@@ -604,6 +721,9 @@ class App:
         else:
             self.pb = Playback(t, True, 0, now, None, "", None, False, "off", tl.context_uri)
         self.track_changed(t)
+        self.remote_expect = (t.uri, t.name, now + 5.0)
+        self.holds.pop("progress", None)
+        self.hold("is_playing", True)
         self.command(fn)
         self.dirty = True
 
@@ -620,11 +740,15 @@ class App:
         def go():
             now = time.monotonic()
             self.local = True
+            self.local_grace_until = now + 8.0
             pb = self._local_pb(now)
             pb.context_uri = tl.context_uri
             if t is not None:
                 pb.track, pb.progress_ms, pb.fetched_at, pb.is_playing = t, 0, now, True
                 self.track_changed(t)
+                self.expect_uri, self.expect_name, self.expect_deadline = t.uri, t.name, now + 4.0
+            else:
+                self.expect_uri = None
             if not self.send(cmd, **args):
                 self.local = False
                 self.flash("SpoTerm's player isn't running", warn=True)
