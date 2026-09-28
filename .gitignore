@@ -10,3 +10,6 @@
 # Python
 __pycache__/
 *.pyc
+
+# Rust engine build output
+engine/target/

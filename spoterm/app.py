@@ -3,8 +3,10 @@
 Design notes (why it stays near 0% CPU):
   * The UI thread sleeps inside getch; it only wakes for input, finished
     background jobs, the next once-a-second progress tick, or a timer.
-  * Playback progress is interpolated locally, so Spotify is polled every few
-    seconds (or at track end) rather than continuously.
+  * When SpoTerm's own engine is the player, commands go down a pipe and state
+    comes back as pushed events: no Web API calls and no polling at all.
+  * For other devices, progress is interpolated locally and Spotify is polled
+    every few seconds (or at track end) rather than continuously.
   * Only the progress line is redrawn each second; everything else is redrawn
     only when something actually changed.
   * All network I/O happens on two worker threads; all state lives on the UI
@@ -63,6 +65,9 @@ class TrackList:
     gen: int = 0                   # bumped on reset so late results are dropped
     sel: int = 0
     top: int = 0
+    retry_at: float = 0.0          # after a failed page, don't ask again before this
+    want_end: bool = False         # G pressed: keep loading and follow the end
+    restore: int | None = None     # selection to return to once enough has reloaded
 
     def reset(self) -> None:
         self.gen += 1
@@ -74,6 +79,9 @@ class TrackList:
         self.stale = False
         self.locked = False
         self.sel = self.top = 0
+        self.retry_at = 0.0
+        self.want_end = False
+        self.restore = None
 
 
 @dataclass(frozen=True)
@@ -94,7 +102,7 @@ HELP = (
         ("n  b", "next / previous"),
         (",  .", "seek 10s"),
         ("-  +", "volume"),
-        ("s  r", "shuffle / repeat"),
+        ("s  R", "shuffle / repeat"),
         ("f", "like track"),
         ("d", "devices"),
     )),
@@ -104,7 +112,8 @@ HELP = (
         ("tab h l", "switch pane"),
         ("j  k", "down / up"),
         ("g  G", "top / bottom"),
-        ("R", "refresh"),
+        ("[  ]", "prev / next list"),
+        ("r", "reload"),
         ("q", "quit"),
     )),
 )
@@ -160,8 +169,9 @@ class App:
         self.theme = Theme()
 
         self.results: queue.SimpleQueue = queue.SimpleQueue()
-        self.ctl = Worker("spoterm-control", self.results)   # playback state + commands
-        self.data = Worker("spoterm-data", self.results)     # library lists + search
+        self.ctl = Worker("spoterm-poll", self.results)      # playback state polls
+        self.cmd = Worker("spoterm-command", self.results)   # commands: never stuck behind a poll
+        self.data = Worker("spoterm-data", self.results)     # library lists, search, likes
         self.inflight = 0
 
         # playback
@@ -173,6 +183,14 @@ class App:
         self.burst = 0                          # quick re-polls left after a command
         self.vol_target: int | None = None
         self.vol_deadline = 0.0
+        self.seek_target: int | None = None
+        self.seek_deadline = 0.0
+        self.cmd_seq = 0                        # bumped per command; older polls are stale
+        self.local = False                      # our engine is the device playing
+        self.expect_until = 0.0                 # engine reply expected: wake quickly till then
+        self.pending_play = None                # a play request waiting for the engine to start
+        self.engine_volume: int | None = None
+        self.user_id: str | None = None
 
         # library
         self.playlists: list = []
@@ -212,6 +230,17 @@ class App:
         worker.submit(fn, done, fail if fail is not None else self.on_error)
 
     def drain(self) -> None:
+        if self.engine:
+            events = self.engine.events
+            while True:
+                try:
+                    ev = events.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    self.on_engine(ev)
+                except Exception as e:
+                    self.flash(f"Internal error: {describe_error(e)}", warn=True)
         while True:
             try:
                 cb, value = self.results.get_nowait()
@@ -233,40 +262,149 @@ class App:
         self.status_until = time.monotonic() + (5.0 if warn else 2.5)
         self.dirty = True
 
-    # ── Playback polling ─────────────────────────────────────────────────────
-    def poll(self) -> None:
-        self.poll_inflight = True
-        self.next_poll = float("inf")
-        self.bg(self.ctl, self.api.playback, self.on_playback, self.on_poll_error)
+    # ── Built-in engine ──────────────────────────────────────────────────────
+    def send(self, cmd: str, **args) -> bool:
+        """Send a command to our own player if it is the active device."""
+        if not (self.local and self.engine and self.engine.send(cmd, **args)):
+            return False
+        self.expect_until = time.monotonic() + 2.0
+        return True
 
-    def poll_soon(self, bursts: int = 2) -> None:
-        """Spotify applies commands with a short lag, so re-check a couple of times."""
-        self.burst = max(self.burst, bursts)
-        if not self.poll_inflight:
-            self.next_poll = min(self.next_poll, time.monotonic() + 0.35)
+    def _local_pb(self, now: float) -> Playback:
+        """The playback state of our own device, taking over the display from any other."""
+        eng, pb = self.engine, self.pb
+        if not self.local or pb is None or pb.device_id != eng.device_id:
+            old = pb if pb is not None and pb.device_id == eng.device_id else None
+            pb = Playback(old.track if old else None, False, 0, now, eng.device_id, eng.name,
+                          old.volume if old else self.engine_volume, False, "off", None)
+            self.pb, self.local = pb, True
+            self.next_poll = float("inf")   # events keep us current: stop polling
+        return pb
 
-    def on_playback(self, pb: Playback | None) -> None:
-        self.poll_inflight = False
-        now = time.monotonic()
-        self.next_poll = now + POLL_ERROR   # never left at inf if the rest of this raises
-        if pb and self.vol_target is not None:
-            pb.volume = self.vol_target
-        self.pb = pb
+    def on_engine(self, ev: dict) -> None:
+        kind, now = ev.get("ev"), time.monotonic()
+        self.dirty = True
+        if kind == "ready":
+            if ev.get("volume") is not None:
+                self.engine_volume = int(ev["volume"])
+            if self.pending_play:
+                fn, self.pending_play = self.pending_play, None
+                fn()
+            return
+        if kind == "exit":
+            was_local, self.local = self.local, False
+            self.pending_play = None
+            code = ev.get("code")
+            if code == 3:
+                self.flash("SpoTerm's player needs you to sign in again: restart SpoTerm", warn=True)
+            elif code:
+                self.flash(f"SpoTerm's player stopped (see {self.engine.log_path})", warn=True)
+            if was_local:
+                self.pb = None
+            self.poll_soon(0)
+            return
+        if kind == "error":
+            if ev.get("kind") != "login":
+                self.flash(f"Player: {ev.get('msg', 'command failed')}", warn=True)
+            return
+        if kind == "reconnecting":
+            self.flash("Reconnecting to Spotify…")
+            return
+        if kind == "reconnected":
+            self.flash("Reconnected")
+            return
+        if kind == "active":
+            if not ev.get("on") and self.local:
+                self.poll_soon(0)       # playback may have moved to another device
+            return
+        if kind in ("volume", "shuffle", "repeat"):
+            if kind == "volume":
+                self.engine_volume = int(ev.get("pct") or 0)
+            if not self.local or self.pb is None:
+                return
+            if kind == "volume":
+                self.pb.volume = self.engine_volume
+            elif kind == "shuffle":
+                self.pb.shuffle = bool(ev.get("on"))
+            else:
+                self.pb.repeat = ev.get("mode") or "off"
+            return
+        if kind == "unavailable":
+            self.flash("That track isn't available", warn=True)
+            return
+        if kind not in ("track", "playing", "paused", "loading", "pos", "stopped", "end"):
+            return
 
-        track = pb.track if pb else None
+        pb = self._local_pb(now)
+        if kind == "track":
+            pb.track = Track(ev.get("uri") or "", ev.get("name") or "Unknown", ev.get("artists") or "",
+                             ev.get("album") or "", int(ev.get("duration_ms") or 0), 0)
+            pb.progress_ms, pb.fetched_at = 0, now
+            self.track_changed(pb.track)
+        elif kind in ("playing", "paused", "loading", "pos"):
+            pb.progress_ms, pb.fetched_at = int(ev.get("pos") or 0), now
+            if kind == "playing":
+                pb.is_playing = True
+            elif kind == "paused":
+                pb.is_playing = False
+        elif kind == "stopped":
+            pb.rebase(now)
+            pb.is_playing = False
+            self.poll_soon(0)           # stopped often means another device took over
+
+    def track_changed(self, track: Track | None) -> None:
+        """Reset the like flag for a new current track and look it up."""
         if track and track.uri != self.liked_uri:
             self.liked_uri, self.liked = track.uri, None
             if track.is_track:
                 uri, tid = track.uri, track.id
-                self.bg(self.ctl, lambda: self.api.is_liked(tid),
-                        lambda v: self._set_liked(uri, v), lambda e: None)
+                def fail(err, uri=uri):
+                    if uri == self.liked_uri:
+                        self.liked_uri = None   # look it up again next time instead of sticking
+                self.bg(self.data, lambda: self.api.is_liked(tid),
+                        lambda v: self._set_liked(uri, v), fail)
+
+    # ── Playback polling ─────────────────────────────────────────────────────
+    def poll(self) -> None:
+        self.poll_inflight = True
+        self.next_poll = float("inf")
+        seq = self.cmd_seq
+        self.bg(self.ctl, self.api.playback, lambda pb: self.on_playback(pb, seq), self.on_poll_error)
+
+    def poll_soon(self, bursts: int = 2, delay: float = 0.35) -> None:
+        """Spotify applies commands with a short lag, so re-check a couple of times."""
+        self.burst = max(self.burst, bursts)
+        if not self.poll_inflight:
+            self.next_poll = min(self.next_poll, time.monotonic() + delay)
+
+    def on_playback(self, pb: Playback | None, seq: int = -1) -> None:
+        self.poll_inflight = False
+        now = time.monotonic()
+        self.next_poll = now + POLL_ERROR   # never left at inf if the rest of this raises
+        if seq != self.cmd_seq:
+            # Started before the latest command: it would undo the instant update. Ask again.
+            self.next_poll = now + 0.6
+            return
+        eng_id = self.engine.device_id if self.engine else None
+        if self.local:
+            if pb is None or (eng_id and pb.device_id == eng_id):
+                self.next_poll = float("inf")   # still ours: the engine's events are fresher
+                return
+            self.local = False                  # playback moved to another device
+        if pb and self.vol_target is not None:
+            pb.volume = self.vol_target
+        self.pb = pb
+        track = pb.track if pb else None
+        self.track_changed(track)
 
         if self.burst > 0:
             self.burst -= 1
             delay = 0.8
-        elif pb and pb.is_playing and track:
+        elif pb and pb.is_playing and track and track.duration_ms:
             remaining = (track.duration_ms - pb.progress(now)) / 1000
             delay = min(POLL_PLAYING, max(0.5, remaining + 0.4))
+        elif pb and pb.is_playing:
+            delay = POLL_PLAYING
         else:
             delay = POLL_IDLE
         self.next_poll = now + delay
@@ -284,16 +422,18 @@ class App:
 
     # ── Playback commands ────────────────────────────────────────────────────
     def command(self, fn, ok_msg: str | None = None) -> None:
+        self.cmd_seq += 1
+
         def done(_):
             if ok_msg:
                 self.flash(ok_msg)
-            self.poll_soon()
+            self.poll_soon(1, delay=1.0)   # give Spotify a moment to apply it
 
         def fail(err):
             self.flash(describe_error(err), warn=True)
             self.poll_soon(1)   # undo optimistic changes with real state
 
-        self.bg(self.ctl, fn, done, fail)
+        self.bg(self.cmd, fn, done, fail)
 
     def toggle_play(self) -> None:
         pb, now = self.pb, time.monotonic()
@@ -301,11 +441,24 @@ class App:
             pb.rebase(now)
         if pb and pb.is_playing:
             pb.is_playing = False
-            self.command(self.api.pause)
+            self.send("pause") or self.command(self.api.pause)
+        elif (not pb or not pb.device_id) and self.engine_can_play():
+            self.play_selected()        # nothing to resume anywhere: play the highlighted track here
         else:
             if pb and pb.track:
                 pb.is_playing = True
-            self.command(self.api.resume)
+            self.send("play") or self.command(self.api.resume)
+        self.dirty = True
+
+    def engine_can_play(self) -> bool:
+        return bool(self.engine and (self.engine.ready or self.engine.status == "starting"))
+
+    def skip(self, forward: bool) -> None:
+        pb = self.pb
+        if pb and pb.track and (forward or pb.progress(time.monotonic()) < 3000):
+            pb.progress_ms, pb.fetched_at = 0, time.monotonic()   # instant feedback
+        if not self.send("next" if forward else "prev"):
+            self.command(self.api.next if forward else self.api.previous)
         self.dirty = True
 
     def seek(self, delta_ms: int) -> None:
@@ -315,8 +468,10 @@ class App:
         now = time.monotonic()
         pos = max(0, min(pb.progress(now) + delta_ms, pb.track.duration_ms - 1000))
         pb.progress_ms, pb.fetched_at = pos, now
-        self.command(lambda: self.api.seek(pos))
         self.dirty = True
+        if self.send("seek", ms=pos):
+            return
+        self.seek_target, self.seek_deadline = pos, now + 0.3   # debounce held keys into one request
 
     def change_volume(self, delta: int) -> None:
         pb = self.pb
@@ -327,8 +482,11 @@ class App:
             return
         self.vol_target = max(0, min(100, base + delta))
         pb.volume = self.vol_target
-        self.vol_deadline = time.monotonic() + 0.25   # debounce key repeats into one request
         self.dirty = True
+        if self.send("volume", pct=self.vol_target):
+            self.vol_target = None                    # local: applied instantly, no debounce
+            return
+        self.vol_deadline = time.monotonic() + 0.25   # debounce key repeats into one request
 
     def flush_volume(self) -> None:
         v, self.vol_deadline = self.vol_target, 0.0
@@ -342,13 +500,19 @@ class App:
             self.flash(describe_error(err), warn=True)
             self.poll_soon(1)
 
-        self.bg(self.ctl, lambda: self.api.volume(v), done, fail)
+        self.cmd_seq += 1
+        self.bg(self.cmd, lambda: self.api.volume(v), done, fail)
+
+    def flush_seek(self) -> None:
+        pos, self.seek_target, self.seek_deadline = self.seek_target, None, 0.0
+        self.command(lambda: self.api.seek(pos))
 
     def toggle_shuffle(self) -> None:
         if not self.pb:
             return
         self.pb.shuffle = on = not self.pb.shuffle
-        self.command(lambda: self.api.shuffle(on))
+        if not self.send("shuffle", on=on):
+            self.command(lambda: self.api.shuffle(on))
         self.dirty = True
 
     def cycle_repeat(self) -> None:
@@ -356,38 +520,60 @@ class App:
             return
         nxt = {"off": "context", "context": "track"}.get(self.pb.repeat, "off")
         self.pb.repeat = nxt
-        self.command(lambda: self.api.repeat(nxt))
+        if not self.send("repeat", mode=nxt):
+            self.command(lambda: self.api.repeat(nxt))
         self.dirty = True
 
     def toggle_like(self) -> None:
         pb = self.pb
-        if not pb or not pb.track or not pb.track.is_track or self.liked is None:
+        if not pb or not pb.track or not pb.track.is_track:
             return
-        uri, tid, new = pb.track.uri, pb.track.id, not self.liked
+        if self.liked is None or pb.track.uri != self.liked_uri:
+            self.flash("Still checking whether this track is liked…")
+            self.track_changed(pb.track)
+            return
+        track, uri, tid, new = pb.track, pb.track.uri, pb.track.id, not self.liked
         self.liked = new
 
         def done(_):
             self.flash("Added to Liked Songs" if new else "Removed from Liked Songs")
-            if "liked" in self.lists:
-                self.lists["liked"].stale = True
+            liked = self.lists.get("liked")
+            if liked and liked.tracks:     # keep the open list in step instead of reloading it
+                if new and all(x.uri != uri for x in liked.tracks):
+                    liked.tracks.insert(0, track)
+                    liked.total += 1
+                    if liked.sel or liked.tracks[1:]:
+                        liked.sel += 1
+                elif not new:
+                    keep = [x for x in liked.tracks if x.uri != uri]
+                    liked.total -= len(liked.tracks) - len(keep)
+                    liked.tracks = keep
+                    liked.sel = min(liked.sel, max(0, len(keep) - 1))
 
         def fail(err):
             self._set_liked(uri, not new)
             self.flash(describe_error(err), warn=True)
 
-        self.bg(self.ctl, lambda: self.api.set_liked(tid, new), done, fail)
+        self.bg(self.cmd, lambda: self.api.set_liked(tid, new), done, fail)
         self.dirty = True
 
     def play_selected(self) -> None:
         tl = self.cur
-        if not tl.tracks:
-            if tl.kind == "playlist" and not tl.loading:
-                ctx = tl.context_uri
-                self.command(lambda: self.api.play(context_uri=ctx))
+        t: Track | None = tl.tracks[tl.sel] if tl.tracks else None
+        if t is None and not (tl.kind == "playlist" and not tl.loading):
             return
-        t: Track = tl.tracks[tl.sel]
-        if not t.playable:
-            self.flash("Local files can't be played through the Spotify API", warn=True)
+        if t is not None and not t.playable:
+            self.flash("This track can't be played (local file or not available)", warn=True)
+            return
+        pb = self.pb
+        remote_busy = bool(pb and pb.is_playing and not self.local and pb.device_id
+                           and pb.device_id != (self.engine.device_id if self.engine else None))
+        if not remote_busy and self.engine_can_play():
+            self.play_here(tl, t)
+            return
+        if t is None:
+            ctx = tl.context_uri
+            self.command(lambda: self.api.play(context_uri=ctx))
             return
         if tl.kind == "playlist":
             ctx, off = tl.context_uri, {"position": t.pos}
@@ -402,12 +588,41 @@ class App:
         now = time.monotonic()
         if self.pb:   # optimistic: show the new track immediately
             self.pb.track, self.pb.progress_ms, self.pb.fetched_at, self.pb.is_playing = t, 0, now, True
+            self.pb.context_uri = tl.context_uri
         else:
-            self.pb = Playback(t, True, 0, now, None, "", None, False, "off", None)
-        if not self.pb.device_id and self.engine_status == "starting":
-            self.flash("Starting the SpoTerm player…")
+            self.pb = Playback(t, True, 0, now, None, "", None, False, "off", tl.context_uri)
+        self.track_changed(t)
         self.command(fn)
         self.dirty = True
+
+    def play_here(self, tl: TrackList, t: Track | None) -> None:
+        """Play on SpoTerm's own engine: one line down a pipe, no Web API call."""
+        if tl.kind == "playlist":
+            cmd, args = "play_context", {"uri": tl.context_uri, "track_uri": t.uri if t else None}
+        else:
+            # Liked Songs and search results play as a track list (what Myx does too), so the
+            # queue runs through everything loaded and shuffle covers all of it.
+            cmd, args = "play_tracks", {"uris": [x.uri for x in tl.tracks if x.playable],
+                                        "start_uri": t.uri}
+
+        def go():
+            now = time.monotonic()
+            self.local = True
+            pb = self._local_pb(now)
+            pb.context_uri = tl.context_uri
+            if t is not None:
+                pb.track, pb.progress_ms, pb.fetched_at, pb.is_playing = t, 0, now, True
+                self.track_changed(t)
+            if not self.send(cmd, **args):
+                self.local = False
+                self.flash("SpoTerm's player isn't running", warn=True)
+            self.dirty = True
+
+        if self.engine.ready:
+            go()
+        else:
+            self.pending_play = go
+            self.flash("Starting SpoTerm's player…")
 
     def open_devices(self) -> None:
         self.overlay, self.devices, self.dev_sel = "devices", None, 0
@@ -421,7 +636,7 @@ class App:
             self.devices = []
             self.on_error(err)
 
-        self.bg(self.ctl, self.api.devices, done, fail)
+        self.bg(self.data, self.api.devices, done, fail)
 
     def pick_device(self) -> None:
         if not self.devices:
@@ -429,7 +644,8 @@ class App:
         d = self.devices[self.dev_sel]
         self.overlay = None
         play = not (self.pb and not self.pb.is_playing)
-        self.command(lambda: self.api.transfer(d.id, play), f"Playing on {d.name}")
+        self.command(lambda: self.api.transfer(d.id, play),
+                     f"{'Playing' if play else 'Switched'} on {d.name}")
 
     # ── Library ──────────────────────────────────────────────────────────────
     def _list(self, key: str) -> TrackList:
@@ -481,7 +697,7 @@ class App:
             self.load_more(tl)
 
     def load_more(self, tl: TrackList) -> None:
-        if tl.loading or tl.next_offset is None:
+        if tl.loading or tl.next_offset is None or time.monotonic() < tl.retry_at:
             return
         tl.loading, off, gen = True, tl.next_offset, tl.gen
         if tl.kind == "liked":
@@ -496,25 +712,40 @@ class App:
         def done(page: api.Page):
             if tl.gen != gen:
                 return
-            tl.loading, tl.error = False, ""
+            tl.loading, tl.error, tl.retry_at = False, "", 0.0
             tl.tracks.extend(page.tracks)
             tl.total, tl.next_offset = page.total, page.next_offset
+            if tl.restore is not None and tl.tracks:
+                tl.sel = min(tl.restore, len(tl.tracks) - 1)
+                if tl.sel == tl.restore or tl.next_offset is None:
+                    tl.restore = None
+            if tl.want_end and tl.tracks:
+                tl.sel = len(tl.tracks) - 1
+                if tl.next_offset is None:
+                    tl.want_end = False
             self.prefetch(tl)
 
         def fail(err):
             if tl.gen != gen:
                 return
             tl.loading = False
-            if tl.kind == "playlist" and getattr(err, "http_status", None) == 403:
+            if tl.kind == "playlist" and getattr(err, "http_status", None) == 403 and not tl.tracks:
                 tl.locked = True
                 tl.next_offset = None
+            elif tl.tracks and getattr(err, "http_status", None) in (400, 404):
+                tl.next_offset = None       # past what Spotify will page through (e.g. search cap)
             else:
                 tl.error = describe_error(err)
+                tl.retry_at = time.monotonic() + 5.0
+                tl.want_end = False
+                if tl.tracks:
+                    self.flash(f"Couldn't load more: {tl.error}", warn=True)
 
         self.bg(self.data, fn, done, fail)
 
     def prefetch(self, tl: TrackList) -> None:
-        if tl.next_offset is not None and tl.sel >= len(tl.tracks) - PREFETCH_ROWS:
+        if tl.next_offset is not None and (tl.want_end or tl.restore is not None
+                                           or tl.sel >= len(tl.tracks) - PREFETCH_ROWS):
             self.load_more(tl)
         elif tl.next_offset is not None and len(tl.tracks) < self.list_rows():
             self.load_more(tl)
@@ -523,7 +754,9 @@ class App:
         self.load_playlists()
         tl = self.cur
         if tl.kind != "search" or tl.query:
+            keep = tl.sel
             tl.reset()
+            tl.restore = keep or None
             self.load_more(tl)
         for other in self.lists.values():
             if other is not tl:
@@ -531,6 +764,8 @@ class App:
         self.poll_soon(0)
 
     def start_search(self) -> None:
+        if self.cur.kind != "search":
+            self.before_search = (self.cur, self.side_sel, self.focus)
         self.side_sel = next(i for i, it in enumerate(self.side) if it.key == "search")
         self.cur = self._list("search")
         self.typing, self.focus = True, "list"
@@ -569,6 +804,10 @@ class App:
         self.dirty = True
 
     def jump(self, end: bool) -> None:
+        tl = self.cur
+        if self.focus == "list":
+            tl.want_end = end and tl.next_offset is not None
+            tl.restore = None
         self.move(10**9 if end else -10**9)
 
     def activate(self) -> None:
@@ -604,6 +843,10 @@ class App:
             self.submit_search()
         elif key == ESC:
             self.typing = False
+            back = getattr(self, "before_search", None)
+            if back and not self.cur.query:
+                self.cur, self.side_sel, self.focus = back
+            self.before_search = None
         elif key in BACKSPACE:
             if c > 0:
                 self.query, self.qcur = q[:c - 1] + q[c:], c - 1
@@ -640,8 +883,8 @@ class App:
             "?": lambda: setattr(self, "overlay", "help"),
             "/": self.start_search,
             " ": self.toggle_play, "p": self.toggle_play,
-            "n": lambda: self.command(self.api.next),
-            "b": lambda: self.command(self.api.previous),
+            "n": lambda: self.skip(True),
+            "b": lambda: self.skip(False),
             ",": lambda: self.seek(-SEEK_STEP_MS), "<": lambda: self.seek(-SEEK_STEP_MS),
             ".": lambda: self.seek(SEEK_STEP_MS), ">": lambda: self.seek(SEEK_STEP_MS),
             curses.KEY_SLEFT: lambda: self.seek(-SEEK_STEP_MS),
@@ -649,10 +892,11 @@ class App:
             "+": lambda: self.change_volume(VOLUME_STEP), "=": lambda: self.change_volume(VOLUME_STEP),
             "-": lambda: self.change_volume(-VOLUME_STEP), "_": lambda: self.change_volume(-VOLUME_STEP),
             "s": self.toggle_shuffle,
-            "r": self.cycle_repeat,
+            "R": self.cycle_repeat,
             "f": self.toggle_like,
             "d": self.open_devices,
-            "R": self.refresh,
+            "r": self.refresh,
+            "[": lambda: self.cycle_list(-1), "]": lambda: self.cycle_list(1),
             "\t": self.toggle_focus, curses.KEY_BTAB: self.toggle_focus,
             "h": self.focus_side, curses.KEY_LEFT: self.focus_side,
             "l": self.focus_list, curses.KEY_RIGHT: self.focus_list,
@@ -679,7 +923,20 @@ class App:
 
     def focus_list(self) -> None:
         if self.focus == "side":
-            self.activate()
+            it = self.side[self.side_sel]
+            if it.kind == "search" or it.key == self.cur.key:
+                self.focus = "list"     # already open: just move over
+            else:
+                self.activate()
+
+    def cycle_list(self, step: int) -> None:
+        """Open the previous / next list in the sidebar."""
+        keys = [i for i, it in enumerate(self.side) if it.selectable and it.kind != "search"]
+        if not keys:
+            return
+        cur = next((k for k in keys if self.side[k].key == self.cur.key), keys[0])
+        self.side_sel = keys[(keys.index(cur) + step) % len(keys)]
+        self.open_list(self.side[self.side_sel].key)
 
     # ── Main loop ────────────────────────────────────────────────────────────
     def run(self) -> None:
@@ -697,7 +954,8 @@ class App:
         self.load_playlists()
         self.open_list("liked")
         if self.engine:
-            self.bg(self.data, self.engine.start, fail=lambda e: None)
+            self.bg(self.data, self.engine.start, fail=self.on_error)
+        self.bg(self.data, self.api.user_id, lambda u: setattr(self, "user_id", u), lambda e: None)
 
         while self.running:
             now = time.monotonic()
@@ -726,6 +984,8 @@ class App:
             self.poll()
         if self.vol_deadline and now >= self.vol_deadline:
             self.flush_volume()
+        if self.seek_deadline and now >= self.seek_deadline:
+            self.flush_seek()
         if self.status and now >= self.status_until:
             self.status = ""
             self.dirty = True
@@ -735,7 +995,7 @@ class App:
                 self.engine_status, self.dirty = st, True
 
     def wait_ms(self, now: float) -> int:
-        if self.inflight:
+        if self.inflight or now < self.expect_until or self.pending_play:
             return 40
         t = self.next_poll - now
         pb = self.pb
@@ -745,6 +1005,8 @@ class App:
             t = min(t, self.status_until - now)
         if self.vol_deadline:
             t = min(t, self.vol_deadline - now)
+        if self.seek_deadline:
+            t = min(t, self.seek_deadline - now)
         return int(max(10, min(2000, t * 1000 + 5)))
 
     def resize(self) -> None:
@@ -859,6 +1121,8 @@ class App:
         dev = pb.device_name if pb else ""
         live = bool(pb and pb.track and pb.is_playing)
         eng = getattr(self, "engine_status", "")
+        if not dev and eng == "ready":
+            dev = self.engine.name       # idle, ready to play here
         if not self._changed("header", (dev, live, eng, self.status, self.status_warn)):
             return False
         s, T, g, W = self.scr, self.theme, self.g, self.W
@@ -874,10 +1138,14 @@ class App:
         else:
             x -= 9
             put(s, 0, x, "no device", T[FAINT])
-        if eng and eng != "off":
-            label = fit("engine " + eng + (g["ell"] if eng == "starting" else ""), 26).rstrip()
+        label = {"starting": "starting player" + g["ell"], "login needed": "player: sign-in needed",
+                 "not built": "player not built"}.get(eng, "player stopped" if eng.startswith("stopped") else "")
+        if label and not self.status:    # a status message outranks the player label
             x -= width(label) + 3
-            put(s, 0, x, label, T[FAINT] if eng in ("ready", "starting") else T[DIM])
+            if x > 12:
+                put(s, 0, x, label, T[FAINT] if eng == "starting" else T[WARN])
+            else:
+                x += width(label) + 3
         avail = x - 12 - 3
         if avail > 4:
             msg = self.status
@@ -1022,12 +1290,14 @@ class App:
         if tl.kind == "search":
             fx, fw = x0 + 8, max(4, w - 8 - len(info) - 2)
             q = self.query if self.typing else tl.query
-            shown = q
-            while shown and width(shown) > fw - 3:   # keep the tail visible while typing
-                shown = shown[1:]
+            room = max(1, fw - 3)
+            start = min(getattr(self, "_qstart", 0), self.qcur) if self.typing else 0
+            while self.typing and start < self.qcur and width(q[start:self.qcur]) > room:
+                start += 1
+            self._qstart = start
+            shown = fit(q[start:], room).rstrip() if width(q[start:]) > room else q[start:]
             if self.typing:   # needed every frame, even when the row itself is unchanged
-                off = width(q[: self.qcur]) - (width(q) - width(shown))
-                self.cursor_at = (y, fx + 2 + max(0, off))
+                self.cursor_at = (y, fx + 2 + width(q[start:self.qcur]))
             key = ("search", shown, self.typing, info)
         else:
             focused = self.focus == "list"
@@ -1247,23 +1517,17 @@ def main() -> None:
 
     engine = Engine(settings) if settings.engine else None
     if engine and engine.available() and engine.needs_login():
-        try:
-            engine.login(auth.token)    # silent with SpoTerm's token when Spotify accepts it
-        except KeyboardInterrupt:
-            print("Skipped: SpoTerm will control your other Spotify devices only.")
-        except Exception as e:
-            print(f"Built-in player unavailable: {e}")
+        engine.login()
 
     # Library log output would scribble over the UI, so send it to a file instead.
     logging.basicConfig(filename=config.config_dir() / "spoterm.log", level=logging.WARNING,
                         format="%(asctime)s %(name)s %(levelname)s %(message)s")
     os.environ.setdefault("ESCDELAY", "25")
-    client = api.Spotify(auth, engine)
+    client = api.Spotify(auth)
     try:
         curses.wrapper(lambda scr: App(scr, client, settings, engine).run())
     except KeyboardInterrupt:
         pass
     finally:
         if engine:
-            engine.enabled = False  # a worker still inside _fallback_device must not respawn it
             engine.stop()

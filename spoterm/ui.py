@@ -98,7 +98,7 @@ def _cw(ch: str) -> int:
     o = ord(ch)
     if o < 0x300:
         return 1 if o >= 0x20 else 0
-    if unicodedata.combining(ch):
+    if unicodedata.combining(ch) or unicodedata.category(ch) in ("Mn", "Me", "Cf"):
         return 0
     return 2 if unicodedata.east_asian_width(ch) in "WF" else 1
 

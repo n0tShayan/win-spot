@@ -1,47 +1,41 @@
-"""SpoTerm's own playback device: a managed librespot process (a Spotify Connect receiver).
+"""SpoTerm's own playback device: the `spoterm-engine` helper (librespot, in Rust).
 
-librespot signs in once (interactive OAuth before curses starts, or silently with
-SpoTerm's own token), caches reusable credentials in <config_dir>/librespot and then
-starts silently on later runs. It never advertises itself on the LAN (discovery off),
-writes only to a log file, and dies with SpoTerm: a Windows Job Object kills it even
-if SpoTerm crashes; elsewhere it is killed on exit.
+The helper is a Spotify Connect player driven over pipes. SpoTerm writes one JSON
+command per line to its stdin and it answers with one JSON event per line on
+stdout. Commands never touch the network on our side, so play, pause, seek and
+volume act instantly, and player state is pushed to us, so there is nothing to poll.
+
+A reader thread blocks on the pipe and queues events for the UI thread; it costs
+nothing while idle. The helper dies with SpoTerm: its stdin closes when we exit,
+and on Windows a Job Object kills it even if SpoTerm crashes.
 """
 
 import atexit
+import json
 import os
+import queue
 import shutil
 import subprocess
 import sys
 import threading
-import time
 from pathlib import Path
-from typing import Callable
 
 from . import config
 
-LOGIN_TIMEOUT = 300        # seconds to wait for the interactive browser login
-TOKEN_LOGIN_TIMEOUT = 20   # seconds to wait for a silent login with SpoTerm's token
-STOP_TIMEOUT = 2.0
-# librespot's --quiet hides the one info line we need ("Authenticated as ..."), so filter
-# explicitly: warnings everywhere, plus session info (a handful of lines per start).
-LOG_FILTER = "warn,librespot_core::session=info,libmdns=off"
-_READY = "Authenticated as"
-_BAD_LOGIN = ("Bad credentials", "Login failed")
 _WIN = sys.platform == "win32"
+EXE = "spoterm-engine.exe" if _WIN else "spoterm-engine"
+EXIT_LOGIN = 3
+STOP_TIMEOUT = 1.5
 
 
 def find_binary(explicit: str = "") -> str | None:
-    """SPOTERM_LIBRESPOT, then PATH, then ~/.cargo/bin, then <config_dir>/bin."""
+    """SPOTERM_ENGINE_BIN, then the project's own build, then <config_dir>/bin, then PATH."""
     if explicit:
         return explicit if Path(explicit).is_file() else None
-    exe = "librespot.exe" if _WIN else "librespot"
-    found = shutil.which("librespot")
-    if found:
-        return found
-    for d in (Path.home() / ".cargo" / "bin", config.config_dir() / "bin"):
-        if (d / exe).is_file():
-            return str(d / exe)
-    return None
+    for p in (config.PROJECT_DIR / "engine" / "target" / "release" / EXE, config.config_dir() / "bin" / EXE):
+        if p.is_file():
+            return str(p)
+    return shutil.which("spoterm-engine")
 
 
 class _KillOnCloseJob:
@@ -101,191 +95,142 @@ class Engine:
         self.name = settings.engine_name
         self.enabled = settings.engine
         self.bitrate = settings.engine_bitrate
-        self.binary = find_binary(settings.librespot) if self.enabled else None
-        self.cache_dir = config.config_dir() / "librespot"
-        self.log_path = config.config_dir() / "librespot.log"
+        self.binary = find_binary(settings.engine_bin) if self.enabled else None
+        self.cache_dir = config.config_dir() / "engine"
+        self.log_path = config.config_dir() / "engine.log"
+        self.events: queue.SimpleQueue = queue.SimpleQueue()   # drained by the UI thread
+        self.device_id: str | None = None
+        self.ready = False
         self._proc: subprocess.Popen | None = None
-        self._job: _KillOnCloseJob | None = None
-        self._lock = threading.Lock()
-        self._ready = False
-        self._bad_login = False
-        self._log_pos = 0
-        self._next_scan = 0.0
+        self._wlock = threading.Lock()
+        self._job = None
+        self._exit_code: int | None = None
+        self._login_needed = False
         atexit.register(self.stop)
 
     # ── State ────────────────────────────────────────────────────────────────
     def available(self) -> bool:
-        return self.enabled and self.binary is not None
+        return bool(self.enabled and self.binary)
 
     def needs_login(self) -> bool:
-        return self._bad_login or not (self.cache_dir / "credentials.json").is_file()
+        return self._login_needed or not (self.cache_dir / "credentials.json").is_file()
 
     def running(self) -> bool:
-        p = self._proc
-        return p is not None and p.poll() is None
+        return self._proc is not None and self._proc.poll() is None
 
     @property
     def status(self) -> str:
-        """"off", "not installed", "login needed", "starting", "ready", "stopped" or "exited (N)"."""
+        """"off", "not built", "login needed", "starting", "ready", or "stopped (N)"."""
         if not self.enabled:
             return "off"
         if not self.binary:
-            return "not installed"
-        with self._lock:
-            p = self._proc
-            if p is not None and not self._ready:
-                self._scan_log()
-            if p is None:
-                return "login needed" if self.needs_login() else "stopped"
-            code = p.poll()
-            if code is not None:
-                return "login needed" if self._bad_login else f"exited ({code})"
-            return "ready" if self._ready else "starting"
+            return "not built"
+        if self._login_needed:
+            return "login needed"
+        if self.running():
+            return "ready" if self.ready else "starting"
+        if self._exit_code is not None:
+            return f"stopped ({self._exit_code})"
+        return "starting" if self._proc is None else "stopped"
 
-    def _scan_log(self) -> None:
-        """Read new log lines while starting, to notice sign-in success or failure."""
-        now = time.monotonic()
-        if now < self._next_scan:
-            return
-        self._next_scan = now + 0.5
+    # ── Login (before curses) ────────────────────────────────────────────────
+    def login(self) -> bool:
+        """One-time browser sign-in for the player. Blocking; prints to the terminal."""
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        print("Signing in SpoTerm's built-in player. Your browser will open; "
+              "approve it and come back here (ctrl+c to skip).")
         try:
-            with open(self.log_path, "rb") as f:
-                f.seek(self._log_pos)
-                chunk = f.read(65536)
-        except OSError:
-            return
-        # Keep the last partial line for the next scan.
-        cut = chunk.rfind(b"\n") + 1
-        self._log_pos += cut
-        text = chunk[:cut].decode("utf-8", "replace")
-        if _READY in text:
-            self._ready = True
-        if any(s in text for s in _BAD_LOGIN):
-            self._bad_login = True
-            # Drop the rejected credentials so the next launch runs the login again.
-            (self.cache_dir / "credentials.json").unlink(missing_ok=True)
+            code = subprocess.call([self.binary, "login", "--cache", str(self.cache_dir)],
+                                   env=self._env())
+        except KeyboardInterrupt:
+            print("\nSkipped. SpoTerm will only control other Spotify devices this time.")
+            return False
+        if code != 0:
+            print(f"Player sign-in failed (exit {code}). Details: {self.log_path}")
+            return False
+        self._login_needed = False
+        return True
 
     # ── Process ──────────────────────────────────────────────────────────────
-    def _argv(self) -> list:
-        return [
-            self.binary,
-            "--name", self.name,
-            "--device-type", "computer",
-            "--backend", "rodio",
-            "--bitrate", str(self.bitrate),
-            "--system-cache", str(self.cache_dir),   # credentials + volume only, no audio cache
-            "--disable-discovery",                   # no zeroconf/mDNS on the LAN
-        ]
-
-    def _spawn(self, argv: list, *, stdout, stderr, env: dict | None = None) -> subprocess.Popen:
-        self.cache_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        # librespot reads any LIBRESPOT_<OPTION> variable as a flag: pass only ours. It has no
-        # use for SpoTerm's own settings either (SPOTIPY_CLIENT_SECRET among them).
-        child_env = {k: v for k, v in os.environ.items()
-                     if not k.upper().startswith(("LIBRESPOT_", "SPOTIPY_", "SPOTERM_"))
-                     and k.upper() != "RUST_BACKTRACE"}
-        child_env.update(env or {}, RUST_LOG=LOG_FILTER)
-        kw: dict = {"stdin": subprocess.DEVNULL, "stdout": stdout, "stderr": stderr,
-                    "env": child_env, "close_fds": True}
+    def start(self) -> None:
+        if not self.available() or self.running() or self.needs_login():
+            return
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        argv = [self.binary, "run", "--cache", str(self.cache_dir), "--name", self.name,
+                "--bitrate", str(self.bitrate)]
+        log = open(self.log_path, "wb")          # the child keeps its own handle
+        kwargs = {}
         if _WIN:
-            kw["creationflags"] = subprocess.CREATE_NO_WINDOW
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
         else:
-            kw["start_new_session"] = True      # keep terminal signals (ctrl+c) away from it
-        proc = subprocess.Popen(argv, **kw)
+            kwargs["start_new_session"] = True
+        try:
+            self._proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                          stderr=log, env=self._env(), bufsize=0, **kwargs)
+        finally:
+            log.close()
+        self.ready, self.device_id, self._exit_code = False, None, None
         if _WIN:
             try:
-                if self._job is None:
-                    self._job = _KillOnCloseJob()
-                self._job.assign(proc)
+                self._job = self._job or _KillOnCloseJob()
+                self._job.assign(self._proc)
             except OSError:
-                pass        # still stopped by stop()/atexit on a normal exit
-        return proc
+                pass   # stdin EOF still stops it when SpoTerm exits normally
+        threading.Thread(target=self._read, args=(self._proc,), name="spoterm-engine",
+                         daemon=True).start()
 
-    def start(self) -> None:
-        """Spawn librespot in the background if it isn't running. Never blocks for long."""
-        with self._lock:
-            if not self.available() or self.needs_login():
-                return
-            if self._proc is not None and self._proc.poll() is None:
-                return
-            self._ready = False
-            self._log_pos = 0
-            self._next_scan = 0.0
-            with open(self.log_path, "wb") as log:  # the child keeps its own handle
-                self._proc = self._spawn(self._argv(), stdout=log, stderr=subprocess.STDOUT)
+    def _env(self) -> dict:
+        # The helper needs nothing of ours: keep secrets and settings out of its environment.
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("SPOTIPY_", "SPOTERM_"))}
+        env.setdefault("RUST_LOG", "warn")
+        return env
+
+    def _read(self, proc: subprocess.Popen) -> None:
+        for raw in proc.stdout:   # blocks in the OS until the helper writes; no polling
+            try:
+                ev = json.loads(raw)
+            except ValueError:
+                continue
+            if not isinstance(ev, dict):
+                continue
+            kind = ev.get("ev")
+            if kind == "ready":
+                self.ready, self.device_id = True, ev.get("device_id")
+            elif kind == "reconnected":
+                self.device_id = ev.get("device_id") or self.device_id
+            elif kind == "error" and ev.get("kind") == "login":
+                self._login_needed = True
+            self.events.put(ev)
+        code = proc.wait()
+        self.ready = False
+        self._exit_code = code
+        if code == EXIT_LOGIN:
+            self._login_needed = True
+        self.events.put({"ev": "exit", "code": code})
+
+    def send(self, cmd: str, **args) -> bool:
+        """Queue a command for the player. Never blocks on the network."""
+        proc = self._proc
+        if not proc or proc.poll() is not None or not self.ready:
+            return False
+        line = (json.dumps({"cmd": cmd, **args}, separators=(",", ":")) + "\n").encode()
+        with self._wlock:
+            try:
+                proc.stdin.write(line)
+                proc.stdin.flush()
+            except OSError:
+                return False
+        return True
 
     def stop(self) -> None:
-        with self._lock:
-            p, self._proc = self._proc, None
-        if p is None or p.poll() is not None:
+        self.enabled = False   # nothing may respawn it after this
+        proc, self._proc = self._proc, None
+        if not proc or proc.poll() is not None:
             return
-        p.terminate()       # TerminateProcess on Windows, SIGTERM elsewhere
         try:
-            p.wait(STOP_TIMEOUT)
-        except subprocess.TimeoutExpired:
-            p.kill()
-            try:
-                p.wait(STOP_TIMEOUT)
-            except subprocess.TimeoutExpired:
-                pass
-
-    # ── One-time login (before curses) ───────────────────────────────────────
-    def login(self, token: Callable[[], str] | None = None, out=print) -> None:
-        """Sign librespot in once and cache its credentials. Blocking; run before curses.
-
-        With `token` (SpoTerm's own access token, which has the `streaming` scope) this is
-        tried silently first; otherwise, or if Spotify refuses it, librespot's interactive
-        OAuth opens a browser. Raises RuntimeError on failure, KeyboardInterrupt to skip.
-        """
-        if not self.available():
-            raise RuntimeError("librespot is not installed")
-        creds = self.cache_dir / "credentials.json"
-        self.stop()
-        creds.unlink(missing_ok=True)       # stale credentials (Spotify refused them)
-        self._bad_login = False
-        if token is not None:
-            out(f"Signing in SpoTerm's built-in player (\"{self.name}\")…")
-            try:
-                # The token goes through the environment, not argv: command lines are
-                # visible to other users' processes, a process's environment is not.
-                env = {"LIBRESPOT_ACCESS_TOKEN": token()}
-                if self._login_run([], env, TOKEN_LOGIN_TIMEOUT):
-                    out("Built-in player signed in.\n")
-                    return
-            except Exception:
-                pass
-            creds.unlink(missing_ok=True)
-        out(f"SpoTerm's built-in player (\"{self.name}\") needs a one-time Spotify login.\n"
-            "A browser window will open; if it doesn't, open the URL below.\n"
-            "Press ctrl+c to skip (SpoTerm will then only control other devices).\n")
-        if not self._login_run(["--enable-oauth"], None, LOGIN_TIMEOUT, out=out):
-            raise RuntimeError(f"librespot login failed; see {self.log_path}")
-        out("Built-in player signed in.\n")
-
-    def _login_run(self, extra: list, env: dict | None, timeout: float, out=None) -> bool:
-        """Run librespot until it has cached credentials (then stop it); True on success.
-
-        With `out`, librespot's stdout is relayed so the user sees its "Browse to: <url>".
-        """
-        creds = self.cache_dir / "credentials.json"
-        with open(self.log_path, "wb") as log:
-            proc = self._spawn(self._argv() + extra, env=env, stderr=log,
-                               stdout=subprocess.PIPE if out else log)
-        if out:
-            def relay():
-                for raw in proc.stdout:
-                    line = raw.decode("utf-8", "replace").strip()
-                    if line.startswith("Browse to:"):
-                        out("  " + line.split(":", 1)[1].strip() + "\n")
-            threading.Thread(target=relay, daemon=True).start()
-        deadline = time.monotonic() + timeout
-        try:
-            while time.monotonic() < deadline and proc.poll() is None:
-                if creds.is_file() and creds.stat().st_size:
-                    time.sleep(0.3)         # let the write finish
-                    return True
-                time.sleep(0.2)
-            return creds.is_file() and creds.stat().st_size > 0
-        finally:
+            with self._wlock:
+                proc.stdin.write(b'{"cmd":"quit"}\n')
+                proc.stdin.close()
+            proc.wait(STOP_TIMEOUT)
+        except (OSError, subprocess.TimeoutExpired):
             proc.kill()
-            proc.wait()

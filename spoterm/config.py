@@ -20,11 +20,11 @@ SCOPE = " ".join((
 
 
 def config_dir() -> Path:
-    if sys.platform == "win32":
-        base = os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming"
-    else:
-        base = os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config"
-    return Path(base) / "spoterm"
+    # Not %APPDATA% on Windows: Microsoft Store Python silently redirects writes there to a
+    # private per-package folder, so the engine (a separate program) and the user would
+    # look in the wrong place. The home folder is never redirected.
+    base = os.environ.get("XDG_CONFIG_HOME") if sys.platform != "win32" else None
+    return Path(base or Path.home() / ".config") / "spoterm"
 
 
 @dataclass(frozen=True)
@@ -37,7 +37,7 @@ class Settings:
     engine: bool = True        # run librespot as SpoTerm's own playback device
     engine_name: str = "SpoTerm"
     engine_bitrate: int = 160  # 96 | 160 | 320; lower is lighter on CPU and network
-    librespot: str = ""        # explicit path to the librespot binary
+    engine_bin: str = ""       # explicit path to the spoterm-engine binary
 
 
 class ConfigError(Exception):
@@ -110,6 +110,17 @@ def _load_env_files() -> None:
                 os.environ.setdefault(k, v)
 
 
+def _migrate_token(token_path: Path) -> None:
+    """Carry the login over from the old %APPDATA% location, so moving folders isn't a re-login."""
+    old = Path(os.environ.get("APPDATA") or "") / "spoterm" / "token.json"
+    if sys.platform != "win32" or token_path.exists() or not old.is_file():
+        return
+    try:
+        token_path.write_bytes(old.read_bytes())
+    except OSError:
+        pass
+
+
 def _flag(name: str, default: bool) -> bool:
     v = os.getenv(name, "").strip().lower()
     return default if not v else v in ("1", "true", "yes", "on")
@@ -117,7 +128,7 @@ def _flag(name: str, default: bool) -> bool:
 
 def load() -> Settings:
     _load_env_files()
-    config_dir().mkdir(mode=0o700, parents=True, exist_ok=True)   # logs and librespot live here
+    config_dir().mkdir(mode=0o700, parents=True, exist_ok=True)   # token, logs and the engine's login live here
 
     client_id = os.getenv("SPOTIPY_CLIENT_ID", "").strip()
     if not client_id:
@@ -129,6 +140,7 @@ def load() -> Settings:
 
     token_path = Path(os.getenv("SPOTERM_TOKEN_PATH") or config_dir() / "token.json")
     token_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _migrate_token(token_path)
 
     bitrate = os.getenv("SPOTERM_BITRATE", "").strip()
     return Settings(
@@ -140,5 +152,5 @@ def load() -> Settings:
         engine=_flag("SPOTERM_ENGINE", True),
         engine_name=os.getenv("SPOTERM_DEVICE_NAME", "").strip() or "SpoTerm",
         engine_bitrate=int(bitrate) if bitrate in ("96", "160", "320") else 160,
-        librespot=os.getenv("SPOTERM_LIBRESPOT", "").strip(),
+        engine_bin=os.getenv("SPOTERM_ENGINE_BIN", "").strip(),
     )

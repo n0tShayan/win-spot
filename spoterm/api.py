@@ -15,7 +15,6 @@ from .net import ApiError, Client
 PAGE_SIZE = 50
 PLAYLIST_PAGE_SIZE = 100
 SEARCH_PAGE_SIZE = 10     # Spotify rejects search limits above 10
-ENGINE_WAIT = 20.0        # seconds to wait for SpoTerm's own player to appear after it starts
 _ITEM_FIELDS = "uri,name,duration_ms,type,is_local,is_playable,artists(name),album(name),show(name)"
 # Spotify renamed each playlist entry's "track" key to "item"; ask for both.
 _PLAYLIST_FIELDS = f"total,next,items(is_local,item({_ITEM_FIELDS}),track({_ITEM_FIELDS}))"
@@ -144,9 +143,8 @@ def make_auth(settings: Settings) -> Auth:
 
 
 class Spotify:
-    def __init__(self, auth: Auth, engine=None):
+    def __init__(self, auth: Auth):
         self.auth = auth
-        self.engine = engine        # engine.Engine: SpoTerm's own device, used when none is active
         self.http = Client("api.spotify.com")
         self._user_id: str | None = None
 
@@ -202,12 +200,12 @@ class Spotify:
         return out
 
     def liked_page(self, offset: int) -> Page:
-        r = self._get("me/tracks", limit=PAGE_SIZE, offset=offset)
+        r = self._get("me/tracks", limit=PAGE_SIZE, offset=offset, market="from_token")
         return self._page(r, offset, lambda i: i.get("track"))
 
     def playlist_page(self, playlist_id: str, offset: int) -> Page:
         r = self._get(f"playlists/{playlist_id}/items", limit=PLAYLIST_PAGE_SIZE, offset=offset,
-                      fields=_PLAYLIST_FIELDS, additional_types="track,episode")
+                      fields=_PLAYLIST_FIELDS, additional_types="track,episode", market="from_token")
         return self._page(r, offset, lambda i: i.get("item") or i.get("track"))
 
     def search_page(self, query: str, offset: int) -> Page:
@@ -239,41 +237,20 @@ class Spotify:
 
     # ── Commands ─────────────────────────────────────────────────────────────
     def _with_device(self, fn):
-        """Run fn(device_id); if Spotify has no active device, retry on the first available one."""
+        """Run fn(device_id); if Spotify has no active device, retry on the first available one.
+
+        Only used for remote devices: when nothing is active SpoTerm plays on its own
+        engine instead, without going through the Web API at all.
+        """
         try:
             return fn(None)
         except ApiError as e:
             if e.status != 404:
                 raise
-        return fn(self._fallback_device().id)
-
-    def _fallback_device(self) -> Device:
-        """The active device, else SpoTerm's own (waiting while it starts up), else the first."""
-        eng, delay, restarted = self.engine, 0.5, False
-        deadline = time.monotonic() + ENGINE_WAIT
-        while True:
-            devs = self.devices()
-            dev = (next((d for d in devs if d.is_active), None)
-                   or next((d for d in devs if eng and d.name == eng.name), None))
-            if dev:
-                return dev
-            if eng and eng.available() and not eng.needs_login() and time.monotonic() < deadline:
-                if not eng.running() and not restarted:
-                    # It died (or never started): restart it once per command, not every
-                    # few seconds, so a crash loop can't respawn it while this waits.
-                    eng.start()
-                    restarted = True
-                if eng.running():
-                    time.sleep(delay)
-                    delay = min(delay * 2, 4.0)
-                    continue
-            if devs:
-                return devs[0]
-            if eng and eng.enabled:
-                why = {"login needed": "needs a login (restart SpoTerm)",
-                       "not installed": "is not installed (librespot)"}.get(eng.status, "didn't start")
-                raise NoDeviceError(f"SpoTerm player {why}. Open Spotify somewhere, or press d")
+        devs = self.devices()
+        if not devs:
             raise NoDeviceError()
+        return fn(next((d for d in devs if d.is_active), devs[0]).id)
 
     def play(self, *, context_uri=None, uris=None, offset=None):
         body = {"context_uri": context_uri, "uris": uris, "offset": offset}
