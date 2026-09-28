@@ -1,117 +1,109 @@
-# SpoTerm — Lightweight Spotify Terminal Client
+# SpoTerm — a minimal Spotify client for the terminal
 
-A clean, keyboard-driven Spotify client that lives entirely in your terminal.
-Zero Electron. Zero background services. Minimal CPU/RAM.
+A clean, keyboard-driven Spotify remote that lives in your terminal and
+stays at roughly 0.1% CPU while music plays.
 
----
+```
+  spoterm    ? help                                              ● Living Room
+
+  LIBRARY                  Out of My League                            46 songs
+  Liked Songs
+  Search                    #  Title                        Artist         Time
+                            1  Out of My League             Fitz and T…    3:29
+  PLAYLISTS                 2  What You Know                Two Door C…    3:11
+  Chill                     3  Undercover Martyn            Two Door C…    2:47
+
+  ─────────────────────────────────────────────────────────────────────────────
+   ▶  Somebody Else                                  ♥   shuffle   repeat  vol 60%
+      The 1975 · I like it when you sleep…
+      3:13 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━──────────────────────────── 5:47
+```
+
+SpoTerm controls Spotify; it doesn't play audio itself. Keep Spotify open on
+any device (desktop app, phone, web player) and SpoTerm drives it.
 
 ## Requirements
 
-- Python 3.8+  (already on most systems)
-- A Spotify account (Free or Premium)
-- Spotify open on **any** device (phone, desktop, browser) — the Web API
-  needs an active device to send commands to.
+- Python 3.10+
+- **Spotify Premium.** The Web API only allows playback control for Premium accounts.
+- A terminal with Unicode support (Windows Terminal, iTerm2, most Linux terminals)
 
----
+## Setup
 
-## 1. Install the only dependency
+1. **Install dependencies**
 
-```
-pip install spotipy
-```
+   ```
+   pip install -r requirements.txt
+   ```
 
----
+2. **Create a Spotify app** at https://developer.spotify.com/dashboard
+   - Add the Redirect URI `http://127.0.0.1:8888/callback`
+   - Enable **Web API**, then copy the **Client ID** and **Client Secret**
 
-## 2. Create a Spotify App (one-time, ~2 minutes)
+3. **Add your credentials.** Copy `.env.example` to `.env` and fill it in:
 
-1. Go to https://developer.spotify.com/dashboard
-2. Click **Create App**
-3. Fill in any name/description
-4. Set **Redirect URI** to:  `http://localhost:8888/callback`
-5. Enable **Web API**
-6. Save → open the app → copy **Client ID** and **Client Secret**
+   ```
+   SPOTIPY_CLIENT_ID=...
+   SPOTIPY_CLIENT_SECRET=...
+   SPOTIPY_REDIRECT_URI=http://127.0.0.1:8888/callback
+   ```
 
----
+   `.env` is git-ignored. SpoTerm reads it from the current folder, the
+   project folder, or the config folder (`%APPDATA%\spoterm` on Windows,
+   `~/.config/spoterm` elsewhere).
 
-## 3. Configure credentials
+4. **Run**
 
-**Option A — environment variables (recommended)**
+   ```
+   python -m spoterm
+   ```
 
-```bat
-set SPOTIPY_CLIENT_ID=your_client_id_here
-set SPOTIPY_CLIENT_SECRET=your_client_secret_here
-set SPOTIPY_REDIRECT_URI=http://localhost:8888/callback
-```
+   The first run opens your browser to log in. The login token is saved to
+   the config folder, not the project, so it can't be committed by accident.
 
-Add these to your `~/.bashrc` / PowerShell profile to make them permanent.
+## Keys
 
-**Option B — edit the file directly**
+| Key | Action |
+|---|---|
+| `space` / `p` | Play / pause |
+| `n` / `b` | Next / previous track |
+| `,` / `.` | Seek back / forward 10s |
+| `-` / `+` | Volume down / up |
+| `s` / `r` | Shuffle / cycle repeat (off, all, one) |
+| `f` | Like / unlike the current track |
+| `d` | Choose playback device |
+| `/` | Search |
+| `enter` | Open list / play track |
+| `tab`, `h`, `l` | Move between sidebar and track list |
+| `j` `k`, `↑` `↓`, `PgUp` `PgDn`, `g` `G` | Navigate |
+| `R` | Refresh |
+| `?` | Help |
+| `q` | Quit |
 
-Open `spoterm.py` and change the CONFIG block near the top:
+## Why it's light
 
-```python
-CONFIG = {
-    "client_id":     "paste_your_client_id_here",
-    "client_secret": "paste_your_client_secret_here",
-    "redirect_uri":  "http://localhost:8888/callback",
-    ...
-}
-```
+- The UI thread sleeps until there's input, a finished request, or the next
+  once-a-second progress tick. There's no busy loop.
+- Progress is interpolated locally, so Spotify is polled every 5s while
+  playing (and right at track end) and every 10s when paused.
+- Each second only the progress line is redrawn. Everything else is redrawn
+  only when it changes.
+- All network calls run on two background threads, so the UI never freezes.
+- Long lists load page by page as you scroll.
 
----
+## Options
 
-## 4. Run
-
-```
-python spoterm.py
-```
-
-The first time you run it, a browser window will open asking you to log in
-and authorize the app. After that, a `.cache` file stores your token and
-you won't be asked again.
-
----
-
-## Controls
-
-| Key          | Action                          |
-|--------------|---------------------------------|
-| `1`          | Playlists view                  |
-| `2`          | Liked Songs view                |
-| `3`          | Search view                     |
-| `j` / `↓`   | Scroll down                     |
-| `k` / `↑`   | Scroll up                       |
-| `PgDn/PgUp`  | Scroll fast                     |
-| `Tab`        | Toggle focus sidebar ↔ tracklist|
-| `Enter`      | Open playlist / Play track      |
-| `/`          | Jump to search & start typing   |
-| `p`          | Play / Pause                    |
-| `n`          | Next track                      |
-| `b`          | Previous track                  |
-| `+` / `=`    | Volume up 10%                   |
-| `-`          | Volume down 10%                 |
-| `q`          | Quit                            |
-
----
-
-## Why it's fast
-
-- **`curses` differential rendering** — only changed cells are redrawn
-- **200ms input poll**, **2s API poll** — no busy-waiting
-- **In-memory cache** for playlists and tracks (TTL-based)
-- **Background thread** for API calls — UI never blocks
-- **Single Python process**, no daemon, no server
-
-Typical RAM: ~15–25 MB.  CPU at idle: <0.5%.
-
----
+| Variable | Effect |
+|---|---|
+| `SPOTERM_ASCII=1` | Use plain ASCII glyphs for fonts without box-drawing characters |
+| `SPOTERM_TOKEN_PATH` | Custom location for the saved login token |
 
 ## Troubleshooting
 
 | Problem | Fix |
 |---|---|
-| "No active playback" | Open Spotify on any device and start playing something once |
-| Browser doesn't open | Copy the URL printed in terminal and open it manually |
-| `ModuleNotFoundError` | Run `pip install spotipy` |
-| Garbled display (Windows) | Use Windows Terminal (not old cmd.exe) |
-| Colors look wrong | Try `set TERM=xterm-256color` |
+| "No active device" | Open Spotify on any device, or press `d` to pick one |
+| "Premium is required" | Playback control is Premium-only on Spotify's side |
+| A playlist says Spotify won't list it | Spotify blocks apps from reading some playlists owned by others. Press `enter` to play it anyway |
+| Garbled glyphs | Use Windows Terminal rather than the legacy console, or set `SPOTERM_ASCII=1` |
+| Something odd happened | Check `spoterm.log` in the config folder |
