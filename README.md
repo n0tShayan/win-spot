@@ -9,8 +9,8 @@ anywhere else: pick a song and press enter.
 When SpoTerm is the player, every key press goes straight to the local engine and
 player state is pushed back as events, so play, pause, skip, seek and volume act
 instantly, and SpoTerm makes **no Web API calls and no polling at all** while music
-plays. If another device (your phone, say) is already playing, SpoTerm controls that
-instead and leaves playback where it is.
+plays. If another device (your phone, say) is the active one, playing or paused,
+SpoTerm controls that instead and plays your picks there.
 
 ```
   spoterm   ? help                                                                       ● SpoTerm
@@ -180,6 +180,7 @@ folder, then the config folder; real environment variables win).
 | `SPOTERM_ENGINE_BIN` | auto | Path to a `spoterm-engine` binary |
 | `SPOTERM_ASCII` | off | Plain ASCII glyphs |
 | `SPOTERM_TOKEN_PATH` | `<config>/token.json` | Where SpoTerm's login is saved |
+| `SPOTERM_DEBUG` | off | `1` logs keys, play decisions and API calls to `spoterm.log` |
 | `HTTPS_PROXY` / `NO_PROXY` | none | Proxy for Web API traffic |
 
 ## Files

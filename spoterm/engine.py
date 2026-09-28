@@ -18,6 +18,7 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 
 from . import config
 
@@ -25,6 +26,7 @@ _WIN = sys.platform == "win32"
 EXE = "spoterm-engine.exe" if _WIN else "spoterm-engine"
 STOP_TIMEOUT = 1.5
 CALL_TIMEOUT = 40.0     # the engine itself gives up on a request well before this
+MALFORMED = "Spotify sent a malformed response"
 
 
 def find_binary(explicit: str = "") -> str | None:
@@ -218,11 +220,21 @@ class Engine:
                             "query": query or None, "body": body}):
             self._calls.pop(cid, None)
             raise ApiError(0, "SpoTerm's engine isn't running")
+        t0 = time.monotonic()
         if not slot[0].wait(CALL_TIMEOUT):
             self._calls.pop(cid, None)
+            if config.DEBUG:
+                config.debug(f"api {method} {path} {query or ''} {body or ''} -> timeout")
             raise TimeoutError()
         ev = slot[1]
         status = ev.get("status") if isinstance(ev.get("status"), int) else 0
+        if config.DEBUG:
+            config.debug(f"api {method} {path} {query or ''} {body or ''} -> {status} "
+                         f"{ev.get('error') or ''} {(time.monotonic() - t0) * 1000:.0f}ms")
+        if method != "GET" and status == 0 and ev.get("error") == MALFORMED:
+            # Player commands now answer 200 with a bare text id; engines built before that
+            # fix report it as malformed. The command worked.
+            return None
         if "error" in ev or status >= 400 or status <= 0:
             b = ev.get("body")
             ra = ev.get("retry_after")

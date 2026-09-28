@@ -16,6 +16,7 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_BODY: usize = 16 << 20;
 const REFRESH_MARGIN: f64 = 60.0;
 const MAX_WAIT_429: u64 = 5;
+const MALFORMED: &str = "Spotify sent a malformed response";
 
 /// The token file, in the format SpoTerm's login writes.
 #[derive(Clone, Serialize, Deserialize)]
@@ -222,7 +223,12 @@ impl Web {
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 continue;
             }
-            let value = read_json(resp).await?;
+            let value = match read_json(resp).await {
+                // Player commands (shuffle, repeat, pause, ...) now answer 200 with a bare
+                // text id rather than JSON or nothing: that is still a success.
+                Err(f) if f.status == 0 && f.msg == MALFORMED && status < 400 => Value::Null,
+                other => other?,
+            };
             if status >= 400 {
                 let msg = value["error"]["message"]
                     .as_str()
@@ -266,5 +272,5 @@ async fn read_json(mut resp: reqwest::Response) -> Result<Value, Failure> {
     if buf.iter().all(u8::is_ascii_whitespace) {
         return Ok(Value::Null);
     }
-    serde_json::from_slice(&buf).map_err(|_| Failure::net("Spotify sent a malformed response"))
+    serde_json::from_slice(&buf).map_err(|_| Failure::net(MALFORMED))
 }

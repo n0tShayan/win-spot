@@ -161,6 +161,7 @@ class Cols:
 
 
 _UNSET = object()   # "never drawn", distinct from any row key
+_SKIPPED = object()  # a queued command that a newer one of the same kind replaced
 
 
 def _scroll(sel: int, top: int, h: int, n: int) -> int:
@@ -226,6 +227,10 @@ class App:
         # After a remote play or skip: (uri wanted, its name, uri to move away from, deadline).
         # Spotify reports the previous track for a moment; those polls are skipped.
         self.remote_expect: tuple | None = None
+        self.remote_acked = False               # Spotify confirmed the remote play request
+        self.remote_from: str | None = None     # what played before it
+        self.remote_fix = None                  # a second try if another track starts instead
+        self.cmd_gen: dict = {}                 # command key -> newest generation (see command)
         # Changes made on a remote device, shown until Spotify reports them (it lags):
         # field -> (value, deadline).
         self.holds: dict = {}
@@ -524,7 +529,18 @@ class App:
             t = pb.track if pb else None
             if now >= deadline or (t and (t.uri == want or t.name == want_name if want
                                           else t.uri != avoid)):
-                self.remote_expect = None
+                self.remote_expect = self.remote_fix = None
+            elif want and t and self.remote_acked and self.remote_fix and t.uri != self.remote_from:
+                # Spotify confirmed the request, yet a third track is playing: it started the
+                # wrong one (seen with shuffle on phones). Ask once more, the other way.
+                if config.DEBUG:
+                    config.debug(f"wrong track after play: got {t.name!r} {t.uri}, wanted {want}")
+                fix, self.remote_fix, self.remote_acked = self.remote_fix, None, False
+                self.remote_from = t.uri
+                self.remote_expect = (want, want_name, None, now + 8.0)
+                self.command(fix, key="select", then=lambda: setattr(self, "remote_acked", True))
+                self.next_poll = now + 0.7
+                return
             else:
                 self.next_poll = now + 0.7      # still the previous track: Spotify is lagging
                 return
@@ -593,19 +609,45 @@ class App:
             self.liked = value
 
     # ── Playback commands ────────────────────────────────────────────────────
-    def command(self, fn, ok_msg: str | None = None) -> None:
+    def command(self, fn, ok_msg: str | None = None, key: str | None = None,
+                then=None, failed=None) -> None:
+        """Send a Web API command. Spotify only answers once the device has applied it
+        (1-2.5 s for a phone), and commands run one at a time, so a newer command with the
+        same `key` (play/pause, shuffle, ...) replaces one still waiting its turn."""
         self.cmd_seq += 1
+        run = fn
+        if key:
+            gen = self.cmd_gen[key] = self.cmd_gen.get(key, 0) + 1
 
-        def done(_):
+            def run():
+                if self.cmd_gen.get(key) != gen:    # read on the worker: newer press queued
+                    return _SKIPPED
+                return fn()
+
+        def done(r):
+            if r is _SKIPPED:
+                return
             if ok_msg:
                 self.flash(ok_msg)
-            self.poll_soon(1, delay=1.0)   # give Spotify a moment to apply it
+            # Applied on the device by now. Keep showing what was asked for until a poll
+            # agrees, counting from now rather than from the key press.
+            now = time.monotonic()
+            for f, (v, d) in list(self.holds.items()):
+                if f != "progress":     # its deadline also dates the seek (see apply_holds)
+                    self.holds[f] = (v, max(d, now + 2.5))
+            if then:
+                then()
+            self.poll_soon(1, delay=0.25)
 
         def fail(err):
+            if config.DEBUG:
+                config.debug(f"command failed: {err!r}")
+            if failed and failed(err):
+                return
             self.flash(describe_error(err), warn=True)
             self.poll_soon(1)   # undo optimistic changes with real state
 
-        self.bg(self.cmd, fn, done, fail)
+        self.bg(self.cmd, run, done, fail)
 
     def toggle_play(self) -> None:
         pb, now = self.pb, time.monotonic()
@@ -617,7 +659,7 @@ class App:
                 self.play_echo.sent(now, False)
             else:
                 self.hold("is_playing", False)
-                self.command(self.api.pause)
+                self.command(self.api.pause, key="playpause")
         elif (not pb or not pb.device_id) and self.engine_can_play():
             self.play_selected()        # nothing to resume anywhere: play the highlighted track here
         else:
@@ -627,7 +669,7 @@ class App:
                 self.play_echo.sent(now, True)
             else:
                 self.hold("is_playing", True)
-                self.command(self.api.resume)
+                self.command(self.api.resume, key="playpause")
         self.dirty = True
 
     def engine_can_play(self) -> bool:
@@ -700,7 +742,7 @@ class App:
 
     def flush_seek(self) -> None:
         pos, self.seek_target, self.seek_deadline = self.seek_target, None, 0.0
-        self.command(lambda: self.api.seek(pos))
+        self.command(lambda: self.api.seek(pos), key="seek")
 
     def toggle_shuffle(self) -> None:
         if not self.pb:
@@ -710,7 +752,7 @@ class App:
             self.shuffle_echo.sent(time.monotonic(), on)
         else:
             self.hold("shuffle", on)
-            self.command(lambda: self.api.shuffle(on))
+            self.command(lambda: self.api.shuffle(on), key="shuffle")
         self.dirty = True
 
     def cycle_repeat(self) -> None:
@@ -722,7 +764,7 @@ class App:
             self.repeat_echo.sent(time.monotonic(), nxt)
         else:
             self.hold("repeat", nxt)
-            self.command(lambda: self.api.repeat(nxt))
+            self.command(lambda: self.api.repeat(nxt), key="repeat")
         self.dirty = True
 
     def toggle_like(self) -> None:
@@ -767,43 +809,74 @@ class App:
             self.flash("This track can't be played (local file or not available)", warn=True)
             return
         pb = self.pb
-        remote_busy = bool(pb and pb.is_playing and not self.local and pb.device_id
-                           and pb.device_id != (self.engine.device_id if self.engine else None))
-        if not remote_busy and self.engine_can_play():
+        eng_id = self.engine.device_id if self.engine else None
+        # Whichever device Spotify says is active gets the song, paused or not, as in
+        # Spotify's own apps: pausing your phone doesn't mean "play on this PC next".
+        # SpoTerm's own player takes over only when no device is active at all.
+        remote = bool(pb and not self.local and pb.device_id and pb.device_id != eng_id)
+        if config.DEBUG:
+            config.debug(f"play {tl.key} sel={tl.sel} -> {t.name if t else None!r} "
+                         f"{t.uri if t else ''} pos={t.pos if t else ''} "
+                         f"{'remote ' + pb.device_name if remote else 'here'} "
+                         f"shuffle={pb.shuffle if pb else None}")
+        if not remote and self.engine_can_play():
             self.play_here(tl, t)
             return
         if t is None:
             ctx = tl.context_uri
-            self.command(lambda: self.api.play(context_uri=ctx))
+            self.command(lambda: self.api.play(context_uri=ctx), key="select")
             return
+        shuffle = bool(pb and pb.shuffle)
+        following = [x.uri for x in tl.tracks[tl.sel:tl.sel + 100] if x.playable]
+        fix = lambda: self.api.play(uris=following)     # plan B: exactly this track, then the rest
         if tl.kind == "playlist":
             # Start from the track itself, not its position: with shuffle on, Spotify applies
             # a position offset to the shuffled order and starts a neighbouring track. Only a
             # track that is in the playlist twice needs its position (which one you picked).
-            ctx = tl.context_uri
+            ctx, pos = tl.context_uri, t.pos
             twice = sum(x.uri == t.uri for x in tl.tracks) > 1
-            off = {"position": t.pos} if twice and not (pb and pb.shuffle) else {"uri": t.uri}
+            off = {"position": pos} if twice and not shuffle else {"uri": t.uri}
             fn = lambda: self.api.play(context_uri=ctx, offset=off)
+            if not shuffle and "uri" in off:
+                fix = lambda: self.api.play(context_uri=ctx, offset={"position": pos})
+        elif tl.kind == "liked":
+            fn = lambda: self.api.play_liked(t, following)
         else:
-            uris = [x.uri for x in tl.tracks[tl.sel:tl.sel + 100] if x.playable]
-            if tl.kind == "liked":
-                fn = lambda: self.api.play_liked(t, uris)
-            else:
-                fn = lambda: self.api.play(uris=uris)
+            fn = fix
 
         now = time.monotonic()
         ctx = self.list_context(tl)
+        self.remote_from = pb.track.uri if pb and pb.track else None
         if self.pb:   # optimistic: show the new track immediately
             self.pb.track, self.pb.progress_ms, self.pb.fetched_at, self.pb.is_playing = t, 0, now, True
             self.pb.context_uri = ctx
         else:
             self.pb = Playback(t, True, 0, now, None, "", None, False, "off", ctx)
         self.track_changed(t)
-        self.remote_expect = (t.uri, t.name, None, now + 5.0)
+        self.remote_expect = (t.uri, t.name, None, now + 8.0)
+        self.remote_acked, self.remote_fix = False, fix
         self.seek_target, self.seek_deadline = None, 0.0
         self.holds.pop("progress", None)
         self.hold("is_playing", True)
-        self.command(fn)
+
+        def acked():
+            self.remote_acked = True
+            exp = self.remote_expect
+            if exp and exp[0] == t.uri:     # give the phone time to report it
+                self.remote_expect = exp[:3] + (max(exp[3], time.monotonic() + 4.0),)
+
+        def failed(err):
+            # The phone went away (app closed): play here instead of just failing.
+            gone = isinstance(err, api.NoDeviceError) or (
+                getattr(err, "http_status", 0) == 404 and "device" in str(err).lower())
+            if gone and self.engine_can_play() and self.cur is tl:
+                self.remote_expect = self.remote_fix = None
+                self.pb = None
+                self.play_here(tl, t)
+                return True
+            return False
+
+        self.command(fn, key="select", then=acked, failed=failed)
         self.dirty = True
 
     def list_context(self, tl: TrackList) -> str | None:
@@ -1066,6 +1139,11 @@ class App:
         if key == curses.KEY_RESIZE:
             self.resize()
             return
+        if config.DEBUG:
+            tl = self.cur
+            t = tl.tracks[tl.sel] if tl.sel < len(tl.tracks) else None
+            config.debug(f"key {key!r} focus={self.focus} list={tl.key} sel={tl.sel} top={tl.top} "
+                         f"at={t.name if t else None!r}")
         self.dirty = True
         if self.typing:
             self.key_typing(key)

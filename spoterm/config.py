@@ -27,6 +27,23 @@ def config_dir() -> str:
     return os.path.join(base or os.path.join(os.path.expanduser("~"), ".config"), "spoterm")
 
 
+DEBUG = False   # SPOTERM_DEBUG=1: trace keys, playback decisions and API calls (set by load)
+_trace = None
+
+
+def debug(msg: str) -> None:
+    """Append a timestamped line to spoterm.log. Callers check DEBUG first, so it's free when off."""
+    global _trace, DEBUG
+    if _trace is None:
+        try:
+            _trace = open(os.path.join(config_dir(), "spoterm.log"), "a", encoding="utf-8", buffering=1)
+        except OSError:
+            DEBUG = False
+            return
+    import time
+    _trace.write(f"{time.strftime('%H:%M:%S')}.{int(time.time() * 1000) % 1000:03d} {msg}\n")
+
+
 class Settings:
     __slots__ = ("client_id", "client_secret", "redirect_uri", "token_path", "ascii",
                  "engine", "engine_name", "engine_bitrate", "engine_bin")
@@ -134,7 +151,9 @@ def _flag(name: str, default: bool) -> bool:
 
 
 def load() -> Settings:
+    global DEBUG
     _load_env_files()
+    DEBUG = _flag("SPOTERM_DEBUG", False)
     os.makedirs(config_dir(), mode=0o700, exist_ok=True)   # token, logs and the engine's login live here
 
     client_id = os.getenv("SPOTIPY_CLIENT_ID", "").strip()
