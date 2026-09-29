@@ -56,6 +56,7 @@ class Engine:
         self.device_id: str | None = None
         self.ready = False             # the player is connected
         self.player_state = ""         # "", "login", "retrying"
+        self.player_error = ""         # why the last player connection attempt failed
         self.alive = threading.Event() # the helper said hello: API calls can flow
         self._proc: subprocess.Popen | None = None
         self._wlock = threading.Lock()
@@ -175,12 +176,18 @@ class Engine:
             return
         dev = ev.get("device_id") if isinstance(ev.get("device_id"), str) else None
         if kind == "ready":
-            self.ready, self.device_id, self.player_state = True, dev, ""
+            self.ready, self.device_id, self.player_state, self.player_error = True, dev, "", ""
+        elif kind == "reconnecting":
+            # The old connection is dead: commands sent now would be dropped.
+            self.ready, self.player_state = False, "retrying"
         elif kind == "reconnected":
+            self.ready, self.player_state, self.player_error = True, "", ""
             self.device_id = dev or self.device_id
         elif kind == "player":
             state = ev.get("state")
             self.player_state = state if state in ("login", "retrying") else ""
+            msg = ev.get("msg")
+            self.player_error = msg if isinstance(msg, str) else ""
         self.events.put(ev)
 
     def _fail_calls(self, why: str) -> None:
@@ -205,6 +212,10 @@ class Engine:
     def send(self, cmd: str, **args) -> bool:
         """Queue a player command. Never blocks on the network."""
         return self.ready and self._write({"cmd": cmd, **args})
+
+    def reconnect(self) -> bool:
+        """Retry the player connection now rather than after the engine's backoff."""
+        return self.running() and self._write({"cmd": "reconnect"})
 
     def call(self, method: str, path: str, query: dict | None = None, body=None):
         """A Web API call made by the engine. Blocks (on a worker thread) until it answers."""

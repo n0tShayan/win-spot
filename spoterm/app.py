@@ -235,6 +235,10 @@ class App:
         # field -> (value, deadline).
         self.holds: dict = {}
         self.user_id: str | None = None
+        self.last_load: tuple | None = None     # (cmd, args) of the last local play, to resume it
+        self.reload_needed = False              # the player reconnected: its queue is gone
+        self.player_warned = False              # the player-offline notice was shown this outage
+        self.poll_err = ""                      # last poll error shown (shown once, not per poll)
 
         # library
         self.playlists: list = []
@@ -301,7 +305,25 @@ class App:
                     self.flash(f"Internal error: {describe_error(e)}", warn=True)
 
     def on_error(self, err: BaseException) -> None:
-        self.flash(describe_error(err), warn=True)
+        self.flash(self.describe(err), warn=True)
+
+    def describe(self, err: BaseException) -> str:
+        """describe_error, but saying why nothing can play when our own player is down too."""
+        no_dev = isinstance(err, api.NoDeviceError) or (
+            getattr(err, "http_status", 0) == 404 and "device" in str(err).lower())
+        if no_dev and self.engine and self.engine.status == "retrying":
+            return ("Spotify lists no active device and SpoTerm's player can't connect "
+                    "(Spotify service trouble). Retrying, press r to retry now")
+        if no_dev:
+            return "Spotify lists no active device. Open Spotify on a device, or press d"
+        return describe_error(err)
+
+    def player_offline(self) -> bool:
+        """Our player is the device but its connection dropped: say so instead of acting."""
+        if self.local and self.engine and not self.engine.ready:
+            self.flash("SpoTerm's player is reconnecting to Spotify" + self.g["ell"], warn=True)
+            return True
+        return False
 
     def flash(self, msg: str, warn: bool = False) -> None:
         self.status, self.status_warn = msg, warn
@@ -343,6 +365,9 @@ class App:
         if kind == "ready":
             if ev.get("volume") is not None:
                 self.engine_volume = min(100, num("volume"))
+            if self.player_warned:
+                self.player_warned = False
+                self.flash("SpoTerm's player is connected")
             if self.pending_play:
                 fn, self.pending_play = self.pending_play, None
                 fn()
@@ -370,13 +395,34 @@ class App:
             return
         if kind == "player":
             if ev.get("state") == "login":
+                self.pending_play = None
                 self.flash("SpoTerm's player needs its sign-in: restart SpoTerm", warn=True)
+            elif ev.get("state") == "retrying":
+                why = text("msg")
+                if self.pending_play:
+                    self.pending_play = None
+                    self.player_warned = False      # this press deserves an answer
+                if not self.player_warned:          # once per outage, not once per retry
+                    self.player_warned = True
+                    if "503" in why or "unavailable" in why.lower():
+                        msg = ("Spotify's playback service is unavailable (their side), so "
+                               "SpoTerm can't play here yet. It keeps retrying; other devices still work")
+                    else:
+                        msg = f"SpoTerm's player can't connect ({why or 'unknown error'}). Retrying"
+                    self.flash(msg, warn=True)
+                    self.status_until = now + 8.0
             return
         if kind == "reconnecting":
-            self.flash("Reconnecting to Spotify…")
+            if self.local and self.pb:
+                self.pb.rebase(now)
+                self.pb.is_playing = False  # the audio stopped with the connection
+                self.reload_needed = True
+            self.next_poll = min(self.next_poll, now + POLL_IDLE)   # events stopped: poll meanwhile
+            self.flash("Connection to Spotify lost, reconnecting" + self.g["ell"], warn=True)
             return
         if kind == "reconnected":
-            self.flash("Reconnected")
+            self.player_warned = False
+            self.flash("Reconnected to Spotify" + (": press space to resume" if self.reload_needed else ""))
             return
         if kind == "active":
             if not ev.get("on") and self.local and now >= self.local_grace_until:
@@ -507,6 +553,7 @@ class App:
 
     def on_playback(self, pb: Playback | None, seq: int = -1) -> None:
         self.poll_inflight = False
+        self.poll_err = ""
         now = time.monotonic()
         self.next_poll = now + POLL_ERROR   # never left at inf if the rest of this raises
         if seq != self.cmd_seq:
@@ -516,7 +563,8 @@ class App:
         eng_id = self.engine.device_id if self.engine else None
         if self.local:
             if pb is None or (eng_id and pb.device_id == eng_id):
-                self.next_poll = float("inf")   # still ours: the engine's events are fresher
+                # Still ours: the engine's events are fresher, unless it's reconnecting.
+                self.next_poll = float("inf") if self.engine.ready else now + POLL_IDLE
                 return
             if now < self.local_grace_until:
                 # Spotify takes a few seconds to notice we took over; ask again after that.
@@ -602,7 +650,10 @@ class App:
         # Honour a long 429 Retry-After (net.py only waits out short ones itself).
         wait = min(max(POLL_ERROR, getattr(err, "retry_after", 0) or 0), 300.0)
         self.next_poll = time.monotonic() + wait
-        self.flash(describe_error(err), warn=True)
+        msg = self.describe(err)
+        if msg != self.poll_err:        # once, not every 15 s while it lasts
+            self.poll_err = msg
+            self.flash(msg, warn=True)
 
     def _set_liked(self, uri: str, value: bool) -> None:
         if uri == self.liked_uri:
@@ -644,15 +695,21 @@ class App:
                 config.debug(f"command failed: {err!r}")
             if failed and failed(err):
                 return
-            self.flash(describe_error(err), warn=True)
+            self.flash(self.describe(err), warn=True)
             self.poll_soon(1)   # undo optimistic changes with real state
 
         self.bg(self.cmd, run, done, fail)
 
     def toggle_play(self) -> None:
         pb, now = self.pb, time.monotonic()
+        if self.player_offline():
+            return
         if pb:
             pb.rebase(now)
+        if self.local and self.reload_needed and pb and pb.track and not pb.is_playing \
+                and self.last_load:
+            self.resume_load(pb, now)
+            return
         if pb and pb.is_playing:
             pb.is_playing = False
             if self.send("pause"):
@@ -672,11 +729,25 @@ class App:
                 self.command(self.api.resume, key="playpause")
         self.dirty = True
 
+    def resume_load(self, pb: Playback, now: float) -> None:
+        """After a reconnect the player has no queue: load the last list again, where it was."""
+        cmd, args = self.last_load
+        args = dict(args, position_ms=pb.progress(now))
+        args["start_uri" if cmd == "play_tracks" else "track_uri"] = pb.track.uri
+        self.local_grace_until = now + 8.0
+        if self.send(cmd, shuffle=pb.shuffle, repeat=pb.repeat, **args):
+            self.reload_needed = False
+            pb.is_playing = True
+            self.play_echo.until = 0.0
+        self.dirty = True
+
     def engine_can_play(self) -> bool:
         return bool(self.engine and (self.engine.ready or self.engine.status == "starting"))
 
     def skip(self, forward: bool) -> None:
         pb, now = self.pb, time.monotonic()
+        if self.player_offline():
+            return
         # A pending seek belongs to the track being left: don't apply it to the next one.
         self.seek_target, self.seek_deadline = None, 0.0
         self.holds.pop("progress", None)
@@ -693,6 +764,8 @@ class App:
 
     def seek(self, delta_ms: int) -> None:
         pb = self.pb
+        if self.player_offline():
+            return
         if not pb or not pb.track:
             return
         now = time.monotonic()
@@ -710,6 +783,8 @@ class App:
 
     def change_volume(self, delta: int) -> None:
         pb = self.pb
+        if self.player_offline():
+            return
         # pb may be gone (a poll found nothing playing) while a volume request is still pending.
         base = (self.vol_target if self.vol_target is not None else pb.volume) if pb else None
         if base is None:
@@ -734,7 +809,7 @@ class App:
 
         def fail(err):
             self.vol_target = None
-            self.flash(describe_error(err), warn=True)
+            self.flash(self.describe(err), warn=True)
             self.poll_soon(1)
 
         self.cmd_seq += 1
@@ -745,6 +820,8 @@ class App:
         self.command(lambda: self.api.seek(pos), key="seek")
 
     def toggle_shuffle(self) -> None:
+        if self.player_offline():
+            return
         if not self.pb:
             return
         self.pb.shuffle = on = not self.pb.shuffle
@@ -756,6 +833,8 @@ class App:
         self.dirty = True
 
     def cycle_repeat(self) -> None:
+        if self.player_offline():
+            return
         if not self.pb:
             return
         nxt = {"off": "context", "context": "track"}.get(self.pb.repeat, "off")
@@ -795,7 +874,7 @@ class App:
 
         def fail(err):
             self._set_liked(uri, not new)
-            self.flash(describe_error(err), warn=True)
+            self.flash(self.describe(err), warn=True)
 
         self.bg(self.cmd, lambda: self.api.set_liked(tid, new), done, fail)
         self.dirty = True
@@ -918,6 +997,7 @@ class App:
                         self.cmd, lambda: self.api.play_on(dev, context_uri=ctx, offset=off))
             else:
                 self.expect_uri = None
+            self.last_load, self.reload_needed = (cmd, args), False
             if not self.send(cmd, shuffle=shuffle, repeat=repeat, **args):
                 self.local = False
                 self.expect_uri = self.expect_retry = None
@@ -1061,6 +1141,9 @@ class App:
         if self.engine and not self.engine.running():
             self.restarts.clear()
             self.bg(self.data, self.engine.restart, fail=self.on_error)
+        elif self.engine and self.engine.status == "retrying" and self.engine.reconnect():
+            self.player_warned = False      # report how this attempt goes
+            self.flash("Retrying SpoTerm's player" + self.g["ell"])
         self.load_playlists()
         tl = self.cur
         if tl.kind != "search" or tl.query:
@@ -1467,7 +1550,7 @@ class App:
         else:
             x -= 9
             put(s, 0, x, "no device", T[FAINT])
-        label = {"starting": "starting player" + g["ell"], "retrying": "player reconnecting" + g["ell"],
+        label = {"starting": "starting player" + g["ell"], "retrying": "player offline, retrying" + g["ell"],
                  "login needed": "player: sign-in needed", "not built": "player not built",
                  }.get(eng, "player stopped" if eng.startswith("stopped") else "")
         if label and not self.status:    # a status message outranks the player label

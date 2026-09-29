@@ -65,7 +65,7 @@ const SCOPES: &[&str] = &[
 ];
 const HEALTH_CHECK: Duration = Duration::from_secs(5);
 const RETRY_MIN: Duration = Duration::from_secs(5);
-const RETRY_MAX: Duration = Duration::from_secs(120);
+const RETRY_MAX: Duration = Duration::from_secs(60);
 
 type Tx = UnboundedSender<Value>;
 
@@ -231,6 +231,8 @@ enum Cmd {
     Shuffle { on: bool },
     Repeat { mode: String },
     Activate,
+    /// Retry the player connection now instead of waiting out the backoff.
+    Reconnect,
     Api {
         id: u64,
         #[serde(default = "get")]
@@ -299,7 +301,8 @@ fn run(o: Opts) -> Result<()> {
                         }
                         Err(e) => {
                             log::warn!("player connect failed: {e:#}");
-                            send(&tx, json!({"ev": "player", "state": "retrying", "msg": format!("{e:#}")}));
+                            send(&tx, json!({"ev": "player", "state": "retrying", "msg": format!("{e:#}"),
+                                             "retry_in": backoff.as_secs()}));
                             retry_at = Instant::now() + backoff;
                             backoff = (backoff * 2).min(RETRY_MAX);
                         }
@@ -312,6 +315,17 @@ fn run(o: Opts) -> Result<()> {
                     }
                     match serde_json::from_str::<Cmd>(&line) {
                         Ok(Cmd::Quit) => break,
+                        Ok(Cmd::Reconnect) => {
+                            let dead = link.as_ref().is_none_or(|l| l.session.is_invalid());
+                            if player_ok && dead && connecting.is_none() {
+                                backoff = RETRY_MIN;
+                                retry_at = Instant::now();
+                                if link.is_some() {
+                                    send(&tx, json!({"ev": "reconnecting"}));
+                                }
+                                connecting = Some(Box::pin(connect(&o, &mixer, &tx)));
+                            }
+                        }
                         Ok(Cmd::Api { id, method, path, query, body }) => {
                             let (web, tx) = (web.clone(), tx.clone());
                             tokio::spawn(async move {
@@ -334,8 +348,8 @@ fn run(o: Opts) -> Result<()> {
                     if !dead || connecting.is_some() || Instant::now() < retry_at {
                         continue;
                     }
-                    if link.is_some() {
-                        send(&tx, json!({"ev": "reconnecting"}));
+                    if link.is_some() && backoff == RETRY_MIN {
+                        send(&tx, json!({"ev": "reconnecting"}));   // once per outage, not per try
                     }
                     connecting = Some(Box::pin(connect(&o, &mixer, &tx)));
                 }
@@ -516,8 +530,7 @@ fn handle(link: Option<&Link>, mixer: &Arc<SoftMixer>, tx: &Tx, cmd: Cmd) {
             ("repeat", r)
         }
         Cmd::Activate => ("activate", spirc.activate()),
-        Cmd::Api { .. } => return,
-        Cmd::Quit => return,
+        Cmd::Api { .. } | Cmd::Reconnect | Cmd::Quit => return,
     };
     if let Err(e) = result {
         let msg = if link.session.is_invalid() { "reconnecting to Spotify".to_string() } else { e.to_string() };

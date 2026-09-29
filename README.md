@@ -113,7 +113,7 @@ in the background in about a second. The header shows `● SpoTerm` when it's re
 | `[` `]` | Previous / next list |
 | `j` `k` `↑` `↓` | Move |
 | `PgUp` `PgDn`, `ctrl+u` `ctrl+d`, `g` `G` | Page, half page, top, bottom |
-| `r` | Reload |
+| `r` | Reload (and retry SpoTerm's player now if it's offline) |
 | `?` | Help |
 | `q` | Quit |
 
@@ -218,6 +218,8 @@ engine/         spoterm-engine (Rust, librespot 0.8): player + Web API calls
 | Header says `player not built` | Build the engine (Install, step 2). |
 | Header says `player: sign-in needed` | Restart SpoTerm; it runs the player sign-in before the UI. |
 | Header says `player stopped` | SpoTerm restarts the engine by itself (three tries a minute); press `r` to try again. Details in `engine.log`. |
+| Header says `player offline, retrying` | SpoTerm's player can't reach Spotify. A 503 in `engine.log` means Spotify's own playback service is down (not SpoTerm); it retries by itself (at least once a minute), `r` retries now, and other devices can still be controlled. |
+| "Spotify lists no active device" while your phone plays | Spotify's servers aren't reporting the phone, which happens during Spotify outages. Check [Spotify Status](https://x.com/SpotifyStatus). |
 | No sound, "no audio output device" | Plug in or enable an output device; SpoTerm pauses instead of crashing and plays again when you press play. |
 | "Spotify Premium is required" | Playback through third-party apps is Premium-only. |
 | "Spotify doesn't let apps list this playlist" | Spotify hides some playlists owned by others from apps. Press enter to play it anyway. |
