@@ -218,7 +218,9 @@ class Spotify:
         out, r = [], self._get("me/playlists", limit=PAGE_SIZE)
         while r:
             for p in r.get("items") or []:
-                if isinstance(p, dict) and p.get("id") and p.get("uri"):
+                # The id goes into a request path, so only Spotify's base62 ids are taken.
+                if (isinstance(p, dict) and isinstance(p.get("id"), str) and p["id"].isascii()
+                        and p["id"].isalnum() and p.get("uri")):
                     counts = p.get("tracks") or p.get("items")
                     total = _num(counts.get("total")) if isinstance(counts, dict) else 0
                     out.append(Playlist(str(p["id"]), str(p["uri"]), str(p.get("name") or "Untitled"), total))

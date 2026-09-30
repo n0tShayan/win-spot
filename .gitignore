@@ -13,3 +13,9 @@ __pycache__/
 
 # Rust engine build output
 engine/target/
+
+# Packaging (build.ps1)
+.venv-build/
+build/
+dist/
+*.egg-info/

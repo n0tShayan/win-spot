@@ -30,10 +30,12 @@ MALFORMED = "Spotify sent a malformed response"
 
 
 def find_binary(explicit: str = "") -> str | None:
-    """SPOTERM_ENGINE_BIN, then the project's own build, then <config_dir>/bin, then PATH."""
+    """SPOTERM_ENGINE_BIN, then the one shipped next to SpoTerm.exe (packaged builds) or the
+    project's own build, then <config_dir>/bin, then PATH."""
     if explicit:
         return explicit if os.path.isfile(explicit) else None
-    for folder in (os.path.join(config.PROJECT_DIR, "engine", "target", "release"),
+    own = config.APP_DIR if config.FROZEN else os.path.join(config.PROJECT_DIR, "engine", "target", "release")
+    for folder in (own,
                    os.path.join(config.config_dir(), "bin"),
                    *os.environ.get("PATH", "").split(os.pathsep)):
         path = os.path.join(folder, EXE)

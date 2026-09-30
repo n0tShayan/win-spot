@@ -6,6 +6,9 @@ import sys
 # Plain os.path and a plain class on purpose: pathlib and dataclasses pull in a dozen
 # more stdlib modules, and memory is a feature here.
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# A packaged build (PyInstaller) sets sys.frozen; its files sit next to SpoTerm.exe.
+FROZEN = bool(getattr(sys, "frozen", False))
+APP_DIR = os.path.dirname(os.path.abspath(sys.executable)) if FROZEN else PROJECT_DIR
 
 SCOPE = " ".join((
     "user-read-playback-state",
@@ -121,8 +124,10 @@ _ENV_KEYS = frozenset(("HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy"))
 
 
 def _load_env_files() -> None:
-    # Real environment variables win; then the first .env that defines a key.
-    for folder in (os.getcwd(), PROJECT_DIR, config_dir()):
+    # Real environment variables win; then the first .env that defines a key. Never the
+    # current folder: a .env planted in whatever folder SpoTerm is started from could
+    # otherwise set SPOTERM_ENGINE_BIN and have us run any program it names.
+    for folder in (APP_DIR, config_dir()):
         try:
             with open(os.path.join(folder, ".env"), encoding="utf-8-sig") as f:
                 text = f.read()
@@ -131,6 +136,23 @@ def _load_env_files() -> None:
         for k, v in parse_env(text).items():
             if k.startswith(_ENV_PREFIXES) or k in _ENV_KEYS:
                 os.environ.setdefault(k, v)
+
+
+def valid_client_id(cid: str) -> bool:
+    """Spotify client ids are 32 hex digits."""
+    return len(cid) == 32 and all(c in "0123456789abcdefABCDEF" for c in cid)
+
+
+def save_client_id(cid: str) -> str:
+    """Add SPOTIPY_CLIENT_ID to the config folder's .env (first run); returns its path."""
+    if not valid_client_id(cid):
+        raise ValueError("not a Spotify client id")
+    os.makedirs(config_dir(), mode=0o700, exist_ok=True)
+    path = os.path.join(config_dir(), ".env")
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(f"\nSPOTIPY_CLIENT_ID={cid}\n")
+    os.environ["SPOTIPY_CLIENT_ID"] = cid
+    return path
 
 
 def _migrate_token(token_path: str) -> None:
@@ -160,7 +182,8 @@ def load() -> Settings:
     if not client_id:
         raise ConfigError(
             "Missing Spotify client ID.\n"
-            "Copy .env.example to .env and set SPOTIPY_CLIENT_ID "
+            "Start SpoTerm in a terminal to enter it, or put SPOTIPY_CLIENT_ID=... in\n"
+            f"{os.path.join(config_dir(), '.env')} "
             "(from your app at https://developer.spotify.com/dashboard)."
         )
 

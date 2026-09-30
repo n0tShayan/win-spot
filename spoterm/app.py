@@ -26,7 +26,7 @@ except ImportError:
     sys.exit("curses is missing. On Windows run:  pip install windows-curses")
 
 from . import api, config
-from .engine import Engine
+from .engine import EXE as ENGINE_EXE, Engine
 from .api import Playback, Track, describe_error
 from .worker import Worker
 from .ui import (ACCENT, DIM, FAINT, MARK, MUTED, SEL, SEL_ACCENT, SEL_DIM, TEXT, TITLE, WARN,
@@ -1921,20 +1921,48 @@ def _signed_in(settings: config.Settings) -> bool:
 
 def _run_login() -> bool:
     """SpoTerm's browser sign-in, in its own process so TLS never loads into this one."""
+    # A packaged SpoTerm.exe is its own interpreter: it runs the login when given --login.
+    argv = [sys.executable, "--login"] if config.FROZEN else [sys.executable, "-m", "spoterm.login"]
     try:
-        return subprocess.call([sys.executable, "-m", "spoterm.login"], cwd=config.PROJECT_DIR) == 0
+        return subprocess.call(argv, cwd=config.PROJECT_DIR) == 0
     except KeyboardInterrupt:
         return False
+
+
+def _ask_client_id() -> bool:
+    """First run with no client id anywhere: ask for it in the terminal and save it."""
+    if not sys.stdin or not sys.stdin.isatty():
+        return False
+    print("Welcome to SpoTerm. It needs the Client ID of your own Spotify app (one-time setup):\n\n"
+          "  1. Open https://developer.spotify.com/dashboard and create an app.\n"
+          "  2. Add the redirect URI  http://127.0.0.1:8888/callback  and tick Web API.\n"
+          "  3. Copy the app's Client ID (no secret needed).\n")
+    while True:
+        try:
+            cid = input("Client ID (enter to quit): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return False
+        if not cid:
+            return False
+        if config.valid_client_id(cid):
+            print(f"Saved to {config.save_client_id(cid)}\n")
+            return True
+        print("That doesn't look like a Client ID (32 letters and digits). Try again.")
 
 
 def main() -> None:
     try:
         settings = config.load()
     except config.ConfigError as e:
-        sys.exit(str(e))
+        if os.getenv("SPOTIPY_CLIENT_ID", "").strip() or not _ask_client_id():
+            sys.exit(str(e))
+        settings = config.load()
 
     engine = Engine(settings)
     if not engine.available():
+        if config.FROZEN:
+            sys.exit(f"{ENGINE_EXE} is missing from {config.APP_DIR}. Download SpoTerm again.")
         sys.exit("SpoTerm's engine isn't built yet. From the project folder run:\n"
                  "  cd engine\n  cargo build --release\n(see the README for details)")
     if not _signed_in(settings) and not _run_login():

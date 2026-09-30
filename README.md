@@ -33,7 +33,23 @@ SpoTerm controls that instead and plays your picks there.
 Requires **Spotify Premium** (Spotify only allows playback through apps like this on
 Premium) and Python 3.10+.
 
-## Install
+## Download (Windows)
+
+No Python or Rust needed:
+
+1. Download `SpoTerm-<version>-windows-x64.zip` from the
+   [Releases](../../releases) page and unzip it anywhere (say `C:\Users\<you>\Apps\SpoTerm`).
+2. Double-click **`SpoTerm.exe`**. Pin it to Start or the taskbar to open it with one click.
+3. On first run it asks for your Spotify app's **Client ID** (see
+   [step 3](#install-from-source) below for making the app) and saves it to
+   `C:\Users\<you>\.config\spoterm\.env`. Then come the two browser sign-ins below.
+
+The zip holds `SpoTerm.exe` (the UI with its own Python runtime), `spoterm-engine.exe`
+and `_internal\`: keep them together. Each release has a `.sha256` file next to the
+zip; check it with `Get-FileHash -Algorithm SHA256 SpoTerm-*.zip`. Windows SmartScreen
+may warn about an unsigned app the first time: **More info → Run anyway**.
+
+## Install from source
 
 1. **Python side.**
 
@@ -77,6 +93,27 @@ Premium) and Python 3.10+.
    ```
    python -m spoterm
    ```
+
+   Or `pip install .` once, which gives you a `spoterm` command you can run from anywhere
+   (put the engine binary in `~/.config/spoterm/bin/` or on `PATH`, and your `.env` in
+   `~/.config/spoterm/`).
+
+## Building the Windows release
+
+```
+powershell -ExecutionPolicy Bypass -File build.ps1
+```
+
+This builds the engine from `Cargo.lock`, freezes the UI with PyInstaller (pinned in
+`packaging/requirements-build.txt`, installed into a private `.venv-build`), puts both
+in `dist\SpoTerm\`, smoke-tests it and writes `dist\SpoTerm-<version>-windows-x64.zip`
+plus its `.sha256`. Upload those two files to a GitHub release. The engine is built
+with the GNU toolchain when it's installed (it links only DLLs that ship with
+Windows), otherwise with MSVC and a static C runtime, so users never need the Visual
+C++ redistributable. `-SkipEngine` reuses an existing engine build.
+
+It's a one-folder build rather than one self-extracting file on purpose: it starts
+instantly (nothing is unpacked to `%TEMP%` each launch) and antivirus flags it far less.
 
 ## First run
 
@@ -163,12 +200,14 @@ How:
   its stdin closes when SpoTerm exits for any reason, crashes included.
 - Tokens are written atomically to the config folder (0600 on POSIX), never logged,
   and never in the repo. `.env` is gitignored.
-- `.env` files may only set `SPOTIPY_*`, `SPOTERM_*` and `HTTPS_PROXY`/`NO_PROXY`.
+- `.env` files may only set `SPOTIPY_*`, `SPOTERM_*` and `HTTPS_PROXY`/`NO_PROXY`,
+  and are never read from the current folder, so a `.env` planted in whatever folder
+  you start SpoTerm from can't point `SPOTERM_ENGINE_BIN` at another program.
 
 ## Options
 
-Environment variables, or lines in `.env` (read from the current folder, the project
-folder, then the config folder; real environment variables win).
+Environment variables, or lines in `.env` (read from the project folder, or the folder
+with `SpoTerm.exe`, then the config folder; real environment variables win).
 
 | Variable | Default | Effect |
 |---|---|---|
@@ -192,6 +231,7 @@ hidden per-app folder.
 
 | Path | Contents |
 |---|---|
+| `.env` | Your settings, e.g. the Client ID `SpoTerm.exe` asks for on first run |
 | `token.json` | SpoTerm's login (the engine refreshes it in place) |
 | `engine/` | The player's saved login, device id and volume |
 | `engine.log` | The engine's log (overwritten each start) |
@@ -209,13 +249,16 @@ spoterm/        the app (Python)
   worker.py     background job threads
   config.py     settings and .env loading
 engine/         spoterm-engine (Rust, librespot 0.8): player + Web API calls
+packaging/      PyInstaller entry script and pinned build tools
+build.ps1       builds the Windows release zip
+pyproject.toml  `pip install .` for a `spoterm` command
 ```
 
 ## Troubleshooting
 
 | Problem | Fix |
 |---|---|
-| Header says `player not built` | Build the engine (Install, step 2). |
+| Header says `player not built` | Build the engine (Install from source, step 2). |
 | Header says `player: sign-in needed` | Restart SpoTerm; it runs the player sign-in before the UI. |
 | Header says `player stopped` | SpoTerm restarts the engine by itself (three tries a minute); press `r` to try again. Details in `engine.log`. |
 | Header says `player offline, retrying` | SpoTerm's player can't reach Spotify. A 503 in `engine.log` means Spotify's own playback service is down (not SpoTerm); it retries by itself (at least once a minute), `r` retries now, and other devices can still be controlled. |
