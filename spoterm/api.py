@@ -395,6 +395,14 @@ class Spotify:
             times.insert(0, 0)
         return Lyrics(lines, times)
 
+    def cover(self, uri: str) -> str:
+        """The cover URL of a song that isn't playing yet (to prefetch the next one)."""
+        r = self.engine.ask("cover", uri=uri)
+        url = r.get("url") if isinstance(r, dict) else None
+        if not (isinstance(url, str) and url.startswith("https://i.scdn.co/image/")):
+            raise ApiError(0, "Spotify sent a malformed cover")
+        return url
+
     def art(self, url: str, cols: int, rows: int, pairs: int) -> Art:
         """The cover `cols` x `rows` cells big: in colour using at most `pairs` colour
         pairs, or as ASCII text when `pairs` is 0."""

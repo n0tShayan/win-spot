@@ -32,8 +32,9 @@ use librespot_connect::{
 use librespot_core::cache::Cache;
 use librespot_core::config::DeviceType;
 use librespot_core::error::ErrorKind;
-use librespot_core::{authentication::Credentials, Session, SessionConfig, SpotifyId};
+use librespot_core::{authentication::Credentials, Session, SessionConfig, SpotifyId, SpotifyUri};
 use librespot_metadata::audio::UniqueFields;
+use librespot_metadata::{Metadata, Track};
 use librespot_oauth::OAuthClientBuilder;
 use librespot_playback::audio_backend::{self, Sink, SinkBuilder, SinkError, SinkResult};
 use librespot_playback::convert::Converter;
@@ -248,6 +249,8 @@ enum Cmd {
         body: Option<Value>,
     },
     Lyrics { id: u64, uri: String },
+    /// The cover URL of a track that isn't playing yet (the next one, to prefetch it).
+    Cover { id: u64, uri: String },
     /// `pairs`: colour pairs the UI has free for half-block colour; 0 asks for ASCII.
     Art { id: u64, url: String, cols: usize, rows: usize, #[serde(default)] pairs: usize },
     Quit,
@@ -350,6 +353,13 @@ fn run(o: Opts) -> Result<()> {
                             let tx = tx.clone();
                             tokio::spawn(async move {
                                 let _ = tx.send(lyrics(session, id, &uri).await);
+                            });
+                        }
+                        Ok(Cmd::Cover { id, uri }) => {
+                            let session = link.as_ref().map(|l| l.session.clone()).filter(|s| !s.is_invalid());
+                            let tx = tx.clone();
+                            tokio::spawn(async move {
+                                let _ = tx.send(cover_url(session, id, &uri).await);
                             });
                         }
                         Ok(Cmd::Art { id, url, cols, rows, pairs }) => {
@@ -551,7 +561,7 @@ fn handle(link: Option<&Link>, mixer: &Arc<SoftMixer>, tx: &Tx, cmd: Cmd) {
             ("repeat", r)
         }
         Cmd::Activate => ("activate", spirc.activate()),
-        Cmd::Api { .. } | Cmd::Lyrics { .. } | Cmd::Art { .. } | Cmd::Reconnect | Cmd::Quit => return,
+        Cmd::Api { .. } | Cmd::Lyrics { .. } | Cmd::Cover { .. } | Cmd::Art { .. } | Cmd::Reconnect | Cmd::Quit => return,
     };
     if let Err(e) = result {
         let msg = if link.session.is_invalid() { "reconnecting to Spotify".to_string() } else { e.to_string() };
@@ -609,6 +619,31 @@ async fn lyrics(session: Option<Session>, id: u64, uri: &str) -> Value {
     answer(id, json!({"synced": l["syncType"] == "LINE_SYNCED", "lines": lines}))
 }
 
+/// A track's cover URL, picked the way the `track` event picks it, so a cover prefetched
+/// for the next track is the one asked for when it starts.
+async fn cover_url(session: Option<Session>, id: u64, uri: &str) -> Value {
+    let Some(session) = session else {
+        return refuse(id, 0, "SpoTerm's player isn't connected");
+    };
+    let track = match SpotifyUri::from_uri(uri) {
+        Ok(t @ SpotifyUri::Track { .. }) => t,
+        _ => return refuse(id, 404, "not a song"),
+    };
+    let track = match Track::get(&session, &track).await {
+        Ok(t) => t,
+        Err(e) => return refuse(id, 0, format!("cover: {e}")),
+    };
+    let template = session
+        .get_user_attribute("image-url")
+        .unwrap_or_else(|| "https://i.scdn.co/image/{file_id}".into());
+    let mut covers: Vec<_> = track.album.covers.iter().filter(|c| !c.id.to_string().is_empty()).collect();
+    covers.sort_by(|a, b| b.width.cmp(&a.width));
+    match covers.iter().rev().find(|c| c.width >= 256).or(covers.first()) {
+        Some(c) => answer(id, json!({"url": template.replace("{file_id}", &c.id.to_string())})),
+        None => refuse(id, 404, "no cover"),
+    }
+}
+
 /// A cover `cols` x `rows` cells big, in colour blocks or ASCII (see art.rs).
 async fn cover_art(web: &web::Web, covers: &art::Covers, id: u64, url: &str, cols: usize, rows: usize,
                    pairs: usize) -> Value {
@@ -664,6 +699,8 @@ fn event_json(ev: PlayerEvent) -> Option<Value> {
             json!({"ev": "pos", "uri": uri(&track_id), "pos": position_ms})
         }
         P::Stopped { .. } => json!({"ev": "stopped"}),
+        // Sent as the player starts loading the next track, ~30 s before this one ends.
+        P::Preloading { track_id } => json!({"ev": "next", "uri": uri(&track_id)}),
         P::EndOfTrack { track_id, .. } => json!({"ev": "end", "uri": uri(&track_id)}),
         P::Unavailable { track_id, .. } => json!({"ev": "unavailable", "uri": uri(&track_id)}),
         P::VolumeChanged { volume } => json!({"ev": "volume", "pct": to_pct(volume)}),

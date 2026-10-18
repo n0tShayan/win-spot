@@ -199,6 +199,15 @@ How:
   and covers stay in memory only (tens of KB), and nothing is written to disk. Synced
   lyrics wake the UI exactly when the next line starts, and only the rows whose
   highlight changed are redrawn.
+- **What you'll want next is fetched early, never anything extra.** While the lyrics
+  view is open, the next song's lyrics and cover are fetched as the player starts
+  preloading it (~30 s before the current one ends), so they're there the moment it
+  starts; it's what the song change would fetch anyway. Resting on a playlist in the
+  sidebar for a moment loads its first page, so enter opens it at once (passing over
+  lists costs nothing), and opening a list that's already loaded fetches nothing.
+- **Covers aren't redrawn for every step of a window resize**, only once it settles.
+  The engine keeps the last two covers compressed (~50 KB), the playing one and the
+  next, so neither is downloaded twice.
 
 ## Security
 

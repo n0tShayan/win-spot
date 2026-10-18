@@ -307,6 +307,10 @@ class App:
         self.extra_wait: dict = {}              # request key -> no retry before (inf: in flight)
         self.lyr_err: tuple = ("", "")          # (track uri, why its lyrics didn't load)
         self.lyr_top: int | None = None         # scrolled by hand; None follows the song
+        self.next_uri: str | None = None        # the song our player is preloading to play next
+        self.next_done = ""                     # the next song whose cover was prefetched
+        self.art_after = 0.0                    # covers wait until a resize settles
+        self.dwell_at = 0.0                     # sidebar selection at rest: prefetch its list
 
         self.status = ""
         self.status_warn = False
@@ -471,6 +475,10 @@ class App:
         if kind == "reconnected":
             self.player_warned = False
             self.flash("Reconnected to Spotify" + (": press space to resume" if self.reload_needed else ""))
+            return
+        if kind == "next":
+            uri = text("uri")
+            self.next_uri = uri if uri.startswith("spotify:track:") else None
             return
         if kind == "active":
             if not ev.get("on") and self.local and now >= self.local_grace_until:
@@ -1093,42 +1101,84 @@ class App:
             self.focus = "list"
 
     def fetch_extras(self, now: float) -> None:
-        """Ask for the playing song's lyrics and cover, only while the lyrics view shows them."""
+        """Ask for the playing song's lyrics and cover while the lyrics view shows them; then,
+        once the player starts preloading the next song (~30 s before this one ends), for
+        that song's too, so they are there the moment it starts. Nothing extra is fetched:
+        it is what the song change would fetch, only earlier."""
         t = self.pb.track if self.pb else None
         if t is None:
             return
-        uri = t.uri
-        if t.is_track and uri not in self.lyrics and now >= self.extra_wait.get(uri, 0.0):
-            self.extra_wait[uri] = float("inf")
+        settled = now >= self.art_after         # mid-resize: wait for the final size
+        busy = False
+        if t.is_track:
+            busy |= self.fetch_lyrics(t.uri, now)
+        key = self.art_key(t.cover)
+        if key and settled:
+            busy |= self.fetch_art(key, now)
+        nxt = self.next_uri
+        if busy or not nxt or nxt == t.uri:
+            return                              # the playing song comes first
+        self.fetch_lyrics(nxt, now)
+        geo = self.art_key("-")
+        if geo and settled and self.next_done != nxt and now >= self.extra_wait.get(nxt + "#", 0.0):
+            self.extra_wait[nxt + "#"] = float("inf")
+            cols, rows, pairs = geo[1:]
 
-            def done(ly, uri=uri):
-                self.extra_wait.pop(uri, None)
-                _remember(self.lyrics, uri, ly, 8)
+            def job(uri=nxt):
+                url = self.api.cover(uri)
+                return url, self.api.art(url, cols, rows, pairs)
 
-            def fail(err, uri=uri):
-                self.extra_wait[uri] = time.monotonic() + 15.0
-                self.lyr_err = (uri, describe_error(err))
+            def done(r, uri=nxt):
+                self.extra_wait.pop(uri + "#", None)
+                self.next_done = uri
+                _remember(self.arts, (r[0], cols, rows, pairs), r[1], 2)
 
-            self.bg(self.data, lambda: self.api.lyrics(uri), done, fail)
-        key = self.art_key(t)
-        if key and key not in self.arts and now >= self.extra_wait.get(key, 0.0):
-            self.extra_wait[key] = float("inf")
+            def fail(err, uri=nxt):
+                self.extra_wait[uri + "#"] = time.monotonic() + 30.0
 
-            def got(lines, key=key):
-                self.extra_wait.pop(key, None)
-                _remember(self.arts, key, lines, 2)
+            self.bg(self.data, job, done, fail)
 
-            def no_art(err, key=key):
-                self.extra_wait[key] = time.monotonic() + 30.0    # the view just shows no cover
+    def fetch_lyrics(self, uri: str, now: float) -> bool:
+        """Ask for a song's lyrics unless known or asked. True while they're on their way."""
+        wait = self.extra_wait.get(uri, 0.0)
+        if uri in self.lyrics or now < wait:
+            return wait == float("inf")
+        self.extra_wait[uri] = float("inf")
 
-            self.bg(self.data, lambda: self.api.art(*key), got, no_art)
+        def done(ly):
+            self.extra_wait.pop(uri, None)
+            _remember(self.lyrics, uri, ly, 8)
 
-    def art_key(self, t: Track | None) -> tuple | None:
-        """What to ask for to draw this track's cover now: (url, cols, rows, colour pairs)."""
+        def fail(err):
+            self.extra_wait[uri] = time.monotonic() + 15.0
+            self.lyr_err = (uri, describe_error(err))
+
+        self.bg(self.data, lambda: self.api.lyrics(uri), done, fail)
+        return True
+
+    def fetch_art(self, key: tuple, now: float) -> bool:
+        """Ask for a cover at one size unless known or asked. True while it's on its way."""
+        wait = self.extra_wait.get(key, 0.0)
+        if key in self.arts or now < wait:
+            return wait == float("inf")
+        self.extra_wait[key] = float("inf")
+
+        def got(art):
+            self.extra_wait.pop(key, None)
+            _remember(self.arts, key, art, 2)
+
+        def no_art(err):
+            self.extra_wait[key] = time.monotonic() + 30.0    # the view just shows no cover
+
+        self.bg(self.data, lambda: self.api.art(*key), got, no_art)
+        return True
+
+    def art_key(self, cover: str) -> tuple | None:
+        """What to ask for to draw this cover now: (url, cols, rows, colour pairs)."""
         cols, rows = self.now_geo(self.layout())[:2]
-        if not (t and t.cover and cols):
+        if not (cover and cols):
             return None
-        return t.cover, cols, rows, self.theme.art_pairs if self.g["half"] else 0
+        return cover, cols, rows, self.theme.art_pairs if self.g["half"] else 0
 
     def now_geo(self, lay: Layout) -> tuple:
         """The lyrics view's areas: (cover cols, cover rows, lyrics x, lyrics width, first row,
@@ -1205,7 +1255,9 @@ class App:
         if tl.stale:
             tl.reset()
         self.cur, self.view = tl, "list"
-        if tl.kind != "search" or tl.query:
+        if tl.tracks:
+            self.prefetch(tl)       # loaded before (or prefetched): more only if needed
+        elif tl.kind != "search" or tl.query:
             self.load_more(tl)
 
     def load_more(self, tl: TrackList) -> None:
@@ -1314,6 +1366,7 @@ class App:
                     break
                 target = i
             self.side_sel = target
+            self.dwell_at = time.monotonic() + 0.35
         elif self.view == "now":
             # Scroll the lyrics by hand; enter follows the song again.
             self.lyr_top = max(0, min(self._lyr_max, self._lyr_shown + delta))
@@ -1459,6 +1512,16 @@ class App:
             else:
                 self.activate()
 
+    def prefetch_side(self) -> None:
+        """The sidebar selection rested on a list: load its first page, so enter opens it
+        at once. Passing over lists on the way costs nothing."""
+        it = self.side[self.side_sel] if self.focus == "side" and self.side else None
+        if it is None or it.kind not in ("liked", "playlist") or it.key == self.cur.key:
+            return
+        tl = self._list(it.key)
+        if not tl.tracks and not tl.loading and not tl.error and not tl.stale:
+            self.load_more(tl)
+
     def cycle_list(self, step: int) -> None:
         """Open the previous / next list in the sidebar."""
         keys = [i for i, it in enumerate(self.side) if it.selectable and it.kind != "search"]
@@ -1530,6 +1593,9 @@ class App:
             self.dirty = True
         if self.view == "now" and not self.too_small:
             self.fetch_extras(now)
+        if self.dwell_at and now >= self.dwell_at:
+            self.dwell_at = 0.0
+            self.prefetch_side()
         if self.engine:
             st = self.engine.status
             if st != self.engine_status:
@@ -1557,6 +1623,10 @@ class App:
             t = min(t, self.restart_at - now)
         if self.expect_uri:
             t = min(t, self.expect_deadline - now)
+        if self.dwell_at:
+            t = min(t, self.dwell_at - now)
+        if self.view == "now" and self.art_after > now:
+            t = min(t, self.art_after - now)
         return int(max(10, min(2000, t * 1000 + 5)))
 
     def resize(self) -> None:
@@ -1573,6 +1643,7 @@ class App:
         self.too_small = self.H < MIN_H or self.W < MIN_W
         self.scr.clear()
         self._size = None   # the screen was wiped: repaint every region
+        self.art_after = time.monotonic() + 0.25   # one cover for the final size, not each step
         self.dirty = True
 
     def set_cursor(self, show: bool) -> None:
@@ -1968,7 +2039,7 @@ class App:
     def draw_cover(self, t: Track | None, x: int, y0: int, aw: int, ah: int, n: int) -> bool:
         """The cover, then its album and artists under it when there is room."""
         s, T, drew = self.scr, self.theme, False
-        key = self.art_key(t)
+        key = self.art_key(t.cover if t else "")
         art = self.arts.get(key) if key else None
         attrs = None
         if art and art.palette:

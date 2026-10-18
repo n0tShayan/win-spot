@@ -10,8 +10,8 @@
 //!   kept one. The UI just defines those pairs and draws runs of one pair;
 //! * or, for terminals without colour, ASCII text on a density ramp.
 //!
-//! The last cover is kept as it came, compressed (not the 270 KB of decoded pixels), so a
-//! resize re-renders it without a download.
+//! The last two covers (the playing one and the next, prefetched) are kept as they came,
+//! compressed (not the 270 KB of decoded pixels each), so neither is downloaded twice.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -43,18 +43,24 @@ pub struct Image {
     px: Vec<u8>,
 }
 
-/// The last cover fetched, still compressed: (url, JPEG).
+const KEEP: usize = 2;
+
+/// The last covers fetched, still compressed: (url, JPEG), newest last.
 #[derive(Default)]
-pub struct Covers(Mutex<Option<(String, Arc<Vec<u8>>)>>);
+pub struct Covers(Mutex<Vec<(String, Arc<Vec<u8>>)>>);
 
 impl Covers {
     pub fn get(&self, url: &str) -> Option<Arc<Vec<u8>>> {
-        self.0.lock().ok()?.as_ref().filter(|c| c.0 == url).map(|c| c.1.clone())
+        self.0.lock().ok()?.iter().find(|c| c.0 == url).map(|c| c.1.clone())
     }
 
     pub fn put(&self, url: &str, jpeg: Arc<Vec<u8>>) {
-        if let Ok(mut slot) = self.0.lock() {
-            *slot = Some((url.to_string(), jpeg));
+        if let Ok(mut kept) = self.0.lock() {
+            kept.retain(|c| c.0 != url);
+            if kept.len() >= KEEP {
+                kept.remove(0);
+            }
+            kept.push((url.to_string(), jpeg));
         }
     }
 }
