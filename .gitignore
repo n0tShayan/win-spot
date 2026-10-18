@@ -13,7 +13,6 @@ __pycache__/
 
 # Rust build output
 engine/target/
-amp/target/
 
 # Packaging (build.ps1)
 .venv-build/

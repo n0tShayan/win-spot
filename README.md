@@ -45,60 +45,9 @@ No Python or Rust needed:
    `C:\Users\<you>\.config\spoterm\.env`. Then come the two browser sign-ins below.
 
 The zip holds `SpoTerm.exe` (the terminal UI with its own Python runtime),
-`SpoTermAmp.exe` (the [Winamp-skinned window](#spotermamp-the-winamp-skinned-window)),
 `spoterm-engine.exe` and `_internal\`: keep them together. Each release has a `.sha256` file next to the
 zip; check it with `Get-FileHash -Algorithm SHA256 SpoTerm-*.zip`. Windows SmartScreen
 may warn about an unsigned app the first time: **More info → Run anyway**.
-
-## SpoTermAmp: the Winamp-skinned window
-
-SpoTerm has a second face: `SpoTermAmp.exe`, a classic Winamp window (main window plus
-a dockable playlist editor) drawn from a real Winamp skin. It drives the same engine as
-the terminal UI, uses the same settings and sign-ins, and is just as frugal: plain Win32
-and GDI, no UI framework, about 4 MB of private memory and 0% CPU when idle. It ships
-with the *Winamp5 Classified* skin built in. Custom skins come later; the skin loader
-already reads any classic `.wsz`.
-
-Double-click `SpoTermAmp.exe` (or `cd amp && cargo build --release` from source; it finds
-the engine in `engine\target\release` by itself). On first run it asks for the Client ID
-in a small window and does both browser sign-ins, just like the terminal UI. Run one UI at
-a time: both are the same "SpoTerm" device.
-
-The playlist editor shows one list at a time: Liked Songs, a playlist or search results.
-Right-click it (or press `L`, or click the eject or `+` button) to pick a list. Right-click
-the main window for everything else: devices, shuffle and repeat, double size, always on
-top, shade mode, sign-in. Double-click a song to play it.
-
-| Key | Action |
-|---|---|
-| `z` `x` `c` `v` `b` | Previous, play, pause, stop, next (Winamp's own keys); `space` also pauses |
-| `←` `→` | Seek 5 s |
-| `↑` `↓` | Volume (main window); move the selection (playlist) |
-| `enter`, `PgUp` `PgDn` `Home` `End` | Play the selection, move through the list |
-| `j` `/` `ctrl+f` | Search (`enter` searches, `esc` cancels, `ctrl+v` pastes) |
-| `l` | Library: Liked Songs, playlists, search |
-| `d` | Devices: move playback to another device, or back here |
-| `s` `r` `f` | Shuffle, repeat (off, all, one), like the current song |
-| `ctrl+d` `ctrl+t` `ctrl+w` `alt+e` | Double size, always on top, shade mode, show/hide the playlist |
-| `ctrl` `+` `-` `0`, `ctrl`+wheel | Larger, smaller, match the screen |
-| `F5` | Reload (and retry the player now if it's offline) |
-
-It opens at the size your screen's scaling calls normal (125% on a 125% display) and
-follows you between monitors with different scaling. Right-click > Size picks anything
-from 100% to 300%; the skin stays pixel-sharp and the playlist's text is drawn at the real
-size, so it's crisp at every size. Clicking the clock switches between elapsed and remaining time. The mouse wheel changes
-the volume over the main window and scrolls the playlist: whichever window the pointer is over, not the focused one. Drag the playlist's
-bottom-right corner to resize it; drag it under the main window and it docks there and
-moves with it. Window positions and options are saved in `amp.cfg` in the config folder.
-Spotify has no equalizer and the engine shares no audio, so the EQ and visualizer
-buttons do nothing.
-
-Why it's light: the UI thread sleeps in `GetMessage` and is woken only by input, an
-engine event, or one timer armed for the next thing actually due (the next whole second
-of the song while it plays, a marquee step while a long title scrolls). The skin is
-decoded once into 1x back buffers; a clock tick redraws a few pixels. Web API answers
-come back as engine events, so there are no worker threads, only one blocked on the
-engine's pipe.
 
 ## Install from source
 
@@ -155,13 +104,13 @@ engine's pipe.
 powershell -ExecutionPolicy Bypass -File build.ps1
 ```
 
-This builds the engine and SpoTermAmp from their `Cargo.lock`, freezes the UI with PyInstaller (pinned in
+This builds the engine from its `Cargo.lock`, freezes the UI with PyInstaller (pinned in
 `packaging/requirements-build.txt`, installed into a private `.venv-build`), puts both
 in `dist\SpoTerm\`, smoke-tests it and writes `dist\SpoTerm-<version>-windows-x64.zip`
 plus its `.sha256`. Upload those two files to a GitHub release. The engine is built
 with the GNU toolchain when it's installed (it links only DLLs that ship with
 Windows), otherwise with MSVC and a static C runtime, so users never need the Visual
-C++ redistributable. `-SkipEngine` reuses existing engine and SpoTermAmp builds.
+C++ redistributable. `-SkipEngine` reuses an existing engine build.
 
 It's a one-folder build rather than one self-extracting file on purpose: it starts
 instantly (nothing is unpacked to `%TEMP%` each launch) and antivirus flags it far less.
@@ -286,7 +235,6 @@ hidden per-app folder.
 | `token.json` | SpoTerm's login (the engine refreshes it in place) |
 | `engine/` | The player's saved login, device id and volume |
 | `engine.log` | The engine's log (overwritten each start) |
-| `amp.cfg` | SpoTermAmp's window positions and options |
 | `crash.log` | Only if SpoTerm ever hits a bug: the details, for a bug report |
 
 ```
@@ -301,11 +249,6 @@ spoterm/        the app (Python)
   worker.py     background job threads
   config.py     settings and .env loading
 engine/         spoterm-engine (Rust, librespot 0.8): player + Web API calls
-amp/            SpoTermAmp (Rust, Win32 + GDI): the Winamp-skinned window
-  skins/        the built-in skin (Winamp5 Classified v5.5)
-  src/app.rs    state, playback and library logic (a port of app.py)
-  src/view.rs   drawing and hit-testing from the skin's sprite sheets
-  src/skin.rs   .wsz loader: zip, BMP, pledit.txt, region.txt
 packaging/      PyInstaller entry script and pinned build tools
 build.ps1       builds the Windows release zip
 pyproject.toml  `pip install .` for a `spoterm` command
@@ -332,5 +275,3 @@ pyproject.toml  `pip install .` for a `spoterm` command
 The engine's session and Connect wiring follows [Myx](https://github.com/HaseebKhalid1507/Myx)
 (MIT, © Haseeb Khalid) and [spotify-player](https://github.com/aome510/spotify-player)
 (MIT, © Thang Pham), and is built on [librespot](https://github.com/librespot-org/librespot).
-SpoTermAmp's built-in skin is *Winamp5 Classified* v5.5 (© 2004-2007 Sven Kistner, Zarko
-Jovic, GuidoD and Wildrose-Wally); its readme is inside `amp/skins/Winamp5_Classified_v5.5.wsz`.

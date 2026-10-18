@@ -3,10 +3,6 @@
 //! `spoterm-engine login --cache DIR` runs the one-time browser login and stores
 //! reusable credentials in DIR.
 //!
-//! `spoterm-engine weblogin --client-id ID --token FILE [--redirect URI]` runs SpoTerm's
-//! own sign-in (your app's client id, PKCE) and writes the token file, for UIs that
-//! have no login of their own (SpoTermAmp).
-//!
 //! `spoterm-engine run --cache DIR --client-id ID --token FILE [--name NAME]
 //! [--bitrate 96|160|320] [--volume PCT] [--no-player]` speaks JSON lines: commands on
 //! stdin, events on stdout, logs on stderr. It does two jobs for the Python UI:
@@ -80,21 +76,8 @@ struct Opts {
     volume_pct: u8,
     client_id: String,
     token: PathBuf,
-    redirect: String,
     player: bool,
 }
-
-/// What SpoTerm's own sign-in asks for (spoterm/config.py SCOPE).
-const WEB_SCOPES: &[&str] = &[
-    "user-read-playback-state",
-    "user-modify-playback-state",
-    "user-read-currently-playing",
-    "user-library-read",
-    "user-library-modify",
-    "playlist-read-private",
-    "playlist-read-collaborative",
-    "streaming",
-];
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
@@ -102,11 +85,9 @@ fn main() {
         .init();
     let result = parse_args().and_then(|(mode, opts)| match mode.as_str() {
         "login" => login(&opts),
-        "weblogin" => web_login(&opts),
         "run" => run(opts),
         _ => bail!("usage: spoterm-engine login|run --cache DIR [--client-id ID --token FILE] \
-                    [--name N] [--bitrate 96|160|320] [--volume PCT] [--no-player]\n\
-                    \x20      spoterm-engine weblogin --client-id ID --token FILE [--redirect URI]"),
+                    [--name N] [--bitrate 96|160|320] [--volume PCT] [--no-player]"),
     });
     if let Err(e) = result {
         eprintln!("spoterm-engine: {e:#}");
@@ -124,7 +105,6 @@ fn parse_args() -> Result<(String, Opts)> {
         volume_pct: 50,
         client_id: String::new(),
         token: PathBuf::new(),
-        redirect: "http://127.0.0.1:8888/callback".into(),
         player: true,
     };
     while let Some(flag) = args.next() {
@@ -146,15 +126,10 @@ fn parse_args() -> Result<(String, Opts)> {
             "--volume" => opts.volume_pct = value.parse::<u8>().unwrap_or(50).min(100),
             "--client-id" => opts.client_id = value,
             "--token" => opts.token = PathBuf::from(value),
-            "--redirect" => opts.redirect = value,
             _ => bail!("unknown option {flag}"),
         }
     }
-    if mode == "weblogin" {
-        if opts.client_id.is_empty() || opts.token.as_os_str().is_empty() {
-            bail!("weblogin needs --client-id and --token");
-        }
-    } else if opts.cache.as_os_str().is_empty() {
+    if opts.cache.as_os_str().is_empty() {
         bail!("--cache is required");
     }
     Ok((mode, opts))
@@ -209,49 +184,6 @@ fn login(o: &Opts) -> Result<()> {
         println!("Signed in as {}.", session.username());
         Ok(())
     })
-}
-
-/// SpoTerm's own sign-in, for the library and search (spoterm/auth.py does the same in
-/// Python). Writes the token file the `run` mode's Web API calls use and refresh.
-fn web_login(o: &Opts) -> Result<()> {
-    let loopback = ["http://127.0.0.1:", "http://localhost:", "http://[::1]:"];
-    if !loopback.iter().any(|p| o.redirect.starts_with(p)) {
-        bail!("the redirect URI must be http://127.0.0.1:PORT/... (got {})", o.redirect);
-    }
-    let client = OAuthClientBuilder::new(&o.client_id, &o.redirect, WEB_SCOPES.to_vec())
-        .open_in_browser()
-        .with_custom_message("SpoTerm is signed in. You can close this tab.")
-        .build()
-        .map_err(|e| anyhow!("{e}"))?;
-    let token = client.get_access_token().map_err(|e| anyhow!("sign-in failed: {e}"))?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let expires_in = token.expires_at.saturating_duration_since(Instant::now()).as_secs();
-    let body = json!({
-        "access_token": token.access_token,
-        "refresh_token": token.refresh_token,
-        "token_type": "Bearer",
-        "expires_in": expires_in,
-        "expires_at": now + expires_in,
-        "scope": token.scopes.join(" "),
-        "pkce": true,
-    });
-    if let Some(dir) = o.token.parent().filter(|d| !d.as_os_str().is_empty()) {
-        std::fs::create_dir_all(dir).context("create token folder")?;
-    }
-    // Atomic replace, so a crash mid-write can't leave a half-written token.
-    let tmp = o.token.with_extension("json.tmp");
-    std::fs::write(&tmp, body.to_string()).context("write token")?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
-    }
-    std::fs::rename(&tmp, &o.token).context("save token")?;
-    println!("Signed in.");
-    Ok(())
 }
 
 // ── Run ──────────────────────────────────────────────────────────────────────
