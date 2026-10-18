@@ -11,6 +11,8 @@ librespot-core = "=0.8.0"
 librespot-connect = "=0.8.0"
 librespot-metadata = "=0.8.0"
 librespot-oauth = "=0.8.0"
+zune-jpeg = { version = "0.5", default-features = false, features = ["std"] }
+zune-core = { version = "0.5", default-features = false, features = ["std"] }
 librespot-playback = { version = "=0.8.0", default-features = false, features = ["native-tls", "rodio-backend"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-std", "io-util"] }
 serde = { version = "1", features = ["derive"] }

@@ -10,7 +10,9 @@
 //! * plays audio as a Spotify Connect device; playback commands go straight to the
 //!   local player, so they act instantly with no Web API round trip;
 //! * makes Web API calls (`api` commands) with SpoTerm's own token, so the UI needs no
-//!   TLS or HTTP code of its own.
+//!   TLS or HTTP code of its own;
+//! * on request only, fetches a song's lyrics (`lyrics`, over the player's own connection)
+//!   and draws its cover for the terminal (`art`), answered like `api` calls.
 //!
 //! Closing stdin shuts everything down, so it never outlives SpoTerm.
 //!
@@ -29,7 +31,8 @@ use librespot_connect::{
 };
 use librespot_core::cache::Cache;
 use librespot_core::config::DeviceType;
-use librespot_core::{authentication::Credentials, Session, SessionConfig};
+use librespot_core::error::ErrorKind;
+use librespot_core::{authentication::Credentials, Session, SessionConfig, SpotifyId};
 use librespot_metadata::audio::UniqueFields;
 use librespot_oauth::OAuthClientBuilder;
 use librespot_playback::audio_backend::{self, Sink, SinkBuilder, SinkError, SinkResult};
@@ -44,6 +47,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
+mod art;
 mod web;
 
 /// librespot's public desktop client id. Spotify only lets this kind of client
@@ -243,6 +247,9 @@ enum Cmd {
         #[serde(default)]
         body: Option<Value>,
     },
+    Lyrics { id: u64, uri: String },
+    /// `pairs`: colour pairs the UI has free for half-block colour; 0 asks for ASCII.
+    Art { id: u64, url: String, cols: usize, rows: usize, #[serde(default)] pairs: usize },
     Quit,
 }
 
@@ -255,6 +262,7 @@ fn run(o: Opts) -> Result<()> {
         let (tx, rx) = unbounded_channel();
         tokio::spawn(writer(rx));
         let web = Arc::new(web::Web::new(o.client_id.clone(), o.token.clone())?);
+        let covers = Arc::new(art::Covers::default());
         send(&tx, json!({"ev": "hello"}));
 
         let cache = open_cache(&o.cache)?;
@@ -335,6 +343,19 @@ fn run(o: Opts) -> Result<()> {
                                                      "body": f.body, "retry_after": f.retry_after}),
                                 };
                                 let _ = tx.send(v);
+                            });
+                        }
+                        Ok(Cmd::Lyrics { id, uri }) => {
+                            let session = link.as_ref().map(|l| l.session.clone()).filter(|s| !s.is_invalid());
+                            let tx = tx.clone();
+                            tokio::spawn(async move {
+                                let _ = tx.send(lyrics(session, id, &uri).await);
+                            });
+                        }
+                        Ok(Cmd::Art { id, url, cols, rows, pairs }) => {
+                            let (web, covers, tx) = (web.clone(), covers.clone(), tx.clone());
+                            tokio::spawn(async move {
+                                let _ = tx.send(cover_art(&web, &covers, id, &url, cols, rows, pairs).await);
                             });
                         }
                         Ok(cmd) => handle(link.as_ref(), &mixer, &tx, cmd),
@@ -530,7 +551,7 @@ fn handle(link: Option<&Link>, mixer: &Arc<SoftMixer>, tx: &Tx, cmd: Cmd) {
             ("repeat", r)
         }
         Cmd::Activate => ("activate", spirc.activate()),
-        Cmd::Api { .. } | Cmd::Reconnect | Cmd::Quit => return,
+        Cmd::Api { .. } | Cmd::Lyrics { .. } | Cmd::Art { .. } | Cmd::Reconnect | Cmd::Quit => return,
     };
     if let Err(e) = result {
         let msg = if link.session.is_invalid() { "reconnecting to Spotify".to_string() } else { e.to_string() };
@@ -548,6 +569,70 @@ fn play_options(shuffle: bool, repeat: &str) -> LoadContextOptions {
     })
 }
 
+fn answer(id: u64, body: Value) -> Value {
+    json!({"ev": "api", "id": id, "status": 200, "body": body})
+}
+
+fn refuse(id: u64, status: u16, msg: impl Into<String>) -> Value {
+    json!({"ev": "api", "id": id, "status": status, "error": msg.into()})
+}
+
+/// A song's lyrics from Spotify's own lyrics service, reached over the player's connection
+/// (the Web API has none): `{"synced": bool, "lines": [[start_ms, text], ...]}`.
+async fn lyrics(session: Option<Session>, id: u64, uri: &str) -> Value {
+    let Some(session) = session else {
+        return refuse(id, 0, "lyrics come through SpoTerm's player, which isn't connected");
+    };
+    let Some(track) = uri.strip_prefix("spotify:track:").and_then(|b62| SpotifyId::from_base62(b62).ok()) else {
+        return refuse(id, 404, "only songs have lyrics");
+    };
+    let bytes = match session.spclient().get_lyrics(&track).await {
+        Ok(b) => b,
+        Err(e) if e.kind == ErrorKind::NotFound => return refuse(id, 404, "no lyrics for this song"),
+        Err(e) => return refuse(id, 0, format!("lyrics: {e}")),
+    };
+    let Ok(v) = serde_json::from_slice::<Value>(&bytes) else {
+        return refuse(id, 0, web::MALFORMED);
+    };
+    let l = &v["lyrics"];
+    let lines: Vec<Value> = l["lines"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|x| {
+                    let ms = x["startTimeMs"].as_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+                    json!([ms, x["words"].as_str().unwrap_or_default()])
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    answer(id, json!({"synced": l["syncType"] == "LINE_SYNCED", "lines": lines}))
+}
+
+/// A cover `cols` x `rows` cells big, in colour blocks or ASCII (see art.rs).
+async fn cover_art(web: &web::Web, covers: &art::Covers, id: u64, url: &str, cols: usize, rows: usize,
+                   pairs: usize) -> Value {
+    if cols == 0 || rows == 0 || cols > art::MAX_COLS || rows > art::MAX_ROWS {
+        return refuse(id, 400, "bad cover size");
+    }
+    let jpeg = match covers.get(url) {
+        Some(j) => j,
+        None => match web.image(url).await {
+            Ok(b) => {
+                let j = Arc::new(b);
+                covers.put(url, j.clone());
+                j
+            }
+            Err(f) => return refuse(id, f.status, f.msg),
+        },
+    };
+    let img = match art::decode(&jpeg) {
+        Ok(i) => i,
+        Err(e) => return refuse(id, 0, e),
+    };
+    answer(id, if pairs > 0 { art::blocks(&img, cols, rows, pairs) } else { art::ascii(&img, cols, rows) })
+}
+
 fn event_json(ev: PlayerEvent) -> Option<Value> {
     use PlayerEvent as P;
     let uri = |id: &librespot_core::SpotifyUri| id.to_uri().unwrap_or_default();
@@ -563,9 +648,13 @@ fn event_json(ev: PlayerEvent) -> Option<Value> {
                     (artists.clone().unwrap_or_default(), album.clone().unwrap_or_default())
                 }
             };
+            // Covers come largest first (640, 300, 64): the smallest that still holds the
+            // 256x256 pixels a cover can be drawn at.
+            let cover = item.covers.iter().rev().find(|c| c.width >= 256).or(item.covers.first())
+                .map(|c| c.url.as_str()).unwrap_or_default();
             json!({
                 "ev": "track", "uri": item.uri, "name": item.name, "artists": artists,
-                "album": album, "duration_ms": item.duration_ms,
+                "album": album, "duration_ms": item.duration_ms, "cover": cover,
             })
         }
         P::Playing { track_id, position_ms, .. } => json!({"ev": "playing", "uri": uri(&track_id), "pos": position_ms}),

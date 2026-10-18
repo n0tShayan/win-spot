@@ -19,10 +19,10 @@ _PLAYLIST_FIELDS = f"total,next,items(is_local,item({_ITEM_FIELDS}),track({_ITEM
 # Plain __slots__ classes rather than dataclasses: dataclasses imports inspect, ast and
 # tokenize, which cost more memory than the whole API layer.
 class Track:
-    __slots__ = ("uri", "name", "artists", "album", "duration_ms", "pos", "playable")
+    __slots__ = ("uri", "name", "artists", "album", "duration_ms", "pos", "playable", "cover")
 
     def __init__(self, uri: str, name: str, artists: str, album: str, duration_ms: int,
-                 pos: int, playable: bool = True):
+                 pos: int, playable: bool = True, cover: str = ""):
         self.uri = uri
         self.name = name
         self.artists = artists
@@ -30,6 +30,7 @@ class Track:
         self.duration_ms = duration_ms
         self.pos = pos              # index within its source list (playlist offset)
         self.playable = playable
+        self.cover = cover          # smallest cover image URL; only known for what plays
 
     @property
     def id(self) -> str:
@@ -82,6 +83,25 @@ class Playback:
         """Freeze the interpolated progress into progress_ms (before changing is_playing)."""
         self.progress_ms = self.progress(now)
         self.fetched_at = now
+
+
+class Lyrics:
+    """A song's lyrics: `times` (start ms per line) is empty when they aren't synced."""
+    __slots__ = ("lines", "times")
+
+    def __init__(self, lines: list, times: list):
+        self.lines, self.times = lines, times
+
+
+class Art:
+    """A cover drawn in terminal cells. In colour: `palette` (0xRRGGBB), `pairs` of
+    (top, bottom) palette indices and `rows`, each its runs of upper half blocks packed two
+    bytes a run (pair index, cells - 1): a 256x256 cover is tens of KB, not a list of
+    tuples ten times that. As text: no palette, and `rows` are plain ASCII lines."""
+    __slots__ = ("palette", "pairs", "rows")
+
+    def __init__(self, palette: list, pairs: list, rows: list):
+        self.palette, self.pairs, self.rows = palette, pairs, rows
 
 
 class Page:
@@ -145,6 +165,19 @@ def _track(item: dict, pos: int, is_local: bool = False) -> Track | None:
     )
 
 
+def _cover(item) -> str:
+    """The cover of a track (its album's) or episode: the smallest that still holds the
+    256x256 pixels a cover can be drawn at (Spotify's 300x300), else the largest."""
+    if not isinstance(item, dict):
+        return ""
+    album = item.get("album")
+    images = album.get("images") if isinstance(album, dict) else item.get("images")
+    sized = [(_num(i.get("width"), 9999), i["url"]) for i in images or ()
+             if isinstance(i, dict) and isinstance(i.get("url"), str)] if isinstance(images, list) else []
+    big = [x for x in sized if x[0] >= 256]
+    return (min(big) if big else max(sized))[1] if sized else ""
+
+
 def describe_error(err: BaseException) -> str:
     """Turn an exception into a short, human-readable status message."""
     if isinstance(err, NoDeviceError):
@@ -193,8 +226,11 @@ class Spotify:
             return None
         dev = r.get("device") if isinstance(r.get("device"), dict) else {}
         vol = dev.get("volume_percent")
+        track = _track(r.get("item"), 0)
+        if track:
+            track.cover = _cover(r.get("item"))
         return Playback(
-            track=_track(r.get("item"), 0),
+            track=track,
             is_playing=bool(r.get("is_playing")),
             progress_ms=max(0, _num(r.get("progress_ms"))),
             fetched_at=now,
@@ -337,3 +373,54 @@ class Spotify:
 
     def set_liked(self, track_id: str, liked: bool):
         self._call("PUT" if liked else "DELETE", "me/library", {"uris": f"spotify:track:{track_id}"})
+
+    # ── Lyrics and cover art (made by the engine; see Engine.ask) ────────────
+    def lyrics(self, uri: str) -> Lyrics:
+        """The song's lyrics; none (an empty Lyrics) when Spotify has none for it."""
+        try:
+            r = self.engine.ask("lyrics", uri=uri)
+        except ApiError as e:
+            if e.status == 404:
+                return Lyrics([], [])
+            raise
+        if not isinstance(r, dict) or not isinstance(r.get("lines"), list):
+            return Lyrics([], [])
+        rows = [x for x in r["lines"] if isinstance(x, list) and len(x) == 2 and isinstance(x[1], str)]
+        # Control characters stripped: a lyric can't send escape sequences to the terminal.
+        lines = [x[1] if x[1].isprintable() else "".join(c for c in x[1] if c.isprintable())
+                 for x in rows]
+        times = [max(0, _num(x[0])) for x in rows] if r.get("synced") is True else []
+        if times and times[0] >= 3000:
+            lines.insert(0, "")         # a long intro shows as an instrumental break
+            times.insert(0, 0)
+        return Lyrics(lines, times)
+
+    def art(self, url: str, cols: int, rows: int, pairs: int) -> Art:
+        """The cover `cols` x `rows` cells big: in colour using at most `pairs` colour
+        pairs, or as ASCII text when `pairs` is 0."""
+        r = self.engine.ask("art", url=url, cols=cols, rows=rows, pairs=pairs)
+        if not isinstance(r, dict):
+            return Art([], [], [])
+        if not pairs:
+            lines = r.get("lines") if isinstance(r.get("lines"), list) else []
+            # Fixed-width printable ASCII only, so nothing odd can reach the terminal.
+            return Art([], [], [x if isinstance(x, str) and x.isascii() and x.isprintable()
+                                and len(x) == cols else " " * cols for x in lines[:rows]])
+        try:
+            palette = [int(c, 16) for c in r["palette"] if len(c) == 6]
+            pal = range(len(palette))
+            pairs_ = [(t, b) for t, b in r["pairs"] if t in pal and b in pal][:pairs]
+            out = []
+            for line in r["rows"][:rows]:
+                cells = [int(line[i:i + 2], 16) for i in range(0, 2 * cols, 2)] if len(line) == 2 * cols else []
+                runs, n = bytearray(), 0
+                for i, c in enumerate(cells):
+                    if c >= len(pairs_):
+                        raise ValueError("bad pair")
+                    if i + 1 == len(cells) or cells[i + 1] != c:
+                        runs += bytes((c, i - n))
+                        n = i + 1
+                out.append(bytes(runs))
+            return Art(palette, pairs_, out)
+        except (KeyError, TypeError, ValueError):
+            raise ApiError(0, "Spotify sent a malformed cover")

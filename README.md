@@ -12,6 +12,11 @@ instantly, and SpoTerm makes **no Web API calls and no polling at all** while mu
 plays. If another device (your phone, say) is the active one, playing or paused,
 SpoTerm controls that instead and plays your picks there.
 
+Press `v` for the lyrics view: the song's cover drawn in colour with half blocks, and
+its lyrics with the line being sung highlighted (the others fading with distance) as the
+song plays. Both come from Spotify itself and are
+fetched only while that view is open.
+
 ```
   spoterm   ? help                                                                       ● SpoTerm
 
@@ -144,6 +149,7 @@ in the background in about a second. The header shows `● SpoTerm` when it's re
 | `R` | Repeat: off, all, one |
 | `f` | Like / unlike the current track |
 | `d` | Devices: move playback to another device, or back to SpoTerm |
+| `v` | Lyrics view: cover art and lyrics (`j` `k` scroll, `enter` follows the song again, `esc` back) |
 | `/` | Search (`esc` cancels, `ctrl+u` clears) |
 | `tab` | Switch between sidebar and list |
 | `←` `→` / `h` `l` | Sidebar / list |
@@ -183,14 +189,26 @@ How:
   next once-a-second progress tick, and **only changed rows are redrawn**.
 - **Other devices** (your phone) are polled adaptively: 5 s while playing and at
   track end, 10 s when paused.
+- **Lyrics and cover art cost nothing until you press `v`**, and little after. Then
+  they're fetched once per song (lyrics are 1 to 7 KB; the cover is Spotify's 300x300
+  image, about 25 KB, drawn at up to 256x256 pixels as the window allows). The engine
+  decodes it, reduces it to 64 colours and to as many
+  top/bottom colour pairs as curses has free, and sends finished runs of cells, so Python
+  never touches an image: it sets up the pairs once per cover and draws a few runs a row.
+  Terminals with fewer than 256 colours (and `SPOTERM_ASCII`) get the cover as text. The last few songs' lyrics
+  and covers stay in memory only (tens of KB), and nothing is written to disk. Synced
+  lyrics wake the UI exactly when the next line starts, and only the rows whose
+  highlight changed are redrawn.
 
 ## Security
 
 - Both logins use OAuth with PKCE, so no client secret is needed or stored. SpoTerm's
   callback server listens on loopback only and checks `state`.
-- The engine talks only to `api.spotify.com` and `accounts.spotify.com`, with the
-  system's TLS (always verified), 10 s timeouts, a 16 MB response cap and no
-  redirects. Links to other hosts are refused.
+- The engine talks only to `api.spotify.com` and `accounts.spotify.com`, plus
+  `i.scdn.co/image/` (Spotify's image CDN, no token sent, 1 MB cap) for covers, with
+  the system's TLS (always verified), 10 s timeouts, a 16 MB response cap and no
+  redirects. Links to other hosts are refused. Lyrics come from Spotify's own lyrics
+  service over the player's existing connection.
 - Nothing from Spotify or the engine is trusted blindly: every field is type-checked
   before use, so malformed data shows as blank or "Unknown", never a crash.
 - Everything drawn from Spotify is stripped of control characters, so a track name
@@ -248,7 +266,7 @@ spoterm/        the app (Python)
   ui.py         theme, glyphs, width-aware text
   worker.py     background job threads
   config.py     settings and .env loading
-engine/         spoterm-engine (Rust, librespot 0.8): player + Web API calls
+engine/         spoterm-engine (Rust, librespot 0.8): player, Web API calls, lyrics, cover art
 packaging/      PyInstaller entry script and pinned build tools
 build.ps1       builds the Windows release zip
 pyproject.toml  `pip install .` for a `spoterm` command

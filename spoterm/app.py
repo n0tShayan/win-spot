@@ -7,7 +7,8 @@ Design notes (why it stays near 0% CPU):
     comes back as pushed events: no Web API calls and no polling at all.
   * For other devices, progress is interpolated locally and Spotify is polled
     every few seconds (or at track end) rather than continuously.
-  * Only the progress line is redrawn each second; everything else is redrawn
+  * Only the progress line is redrawn each second (and, in the lyrics view, the rows
+    whose highlight moved when a new line starts); everything else is redrawn
     only when something actually changed.
   * All network I/O happens on two worker threads; all state lives on the UI
     thread, so there are no locks and no races.
@@ -120,6 +121,7 @@ HELP = (
         ("s  R", "shuffle / repeat"),
         ("f", "like track"),
         ("d", "devices"),
+        ("v", "lyrics + cover"),
     )),
     ("Browse", (
         ("/", "search"),
@@ -162,6 +164,43 @@ class Cols:
 
 _UNSET = object()   # "never drawn", distinct from any row key
 _SKIPPED = object()  # a queued command that a newer one of the same kind replaced
+
+
+def _wrap(text: str, w: int) -> list:
+    """Word-wrap to w columns; a word longer than a line is cut."""
+    if width(text) <= w:
+        return [text]
+    out, cur = [], ""
+    for word in text.split():
+        while width(word) > w:
+            n = used = 0
+            for c in word:
+                used += width(c)
+                if used > w:
+                    break
+                n += 1
+            if cur:
+                out.append(cur)
+                cur = ""
+            out.append(word[:max(1, n)])
+            word = word[max(1, n):]
+        if not cur:
+            cur = word
+        elif width(cur) + 1 + width(word) <= w:
+            cur += " " + word
+        else:
+            out.append(cur)
+            cur = word
+    if cur:
+        out.append(cur)
+    return out or [""]
+
+
+def _remember(cache: dict, key, value, keep: int) -> None:
+    """Store in a small cache that forgets its oldest entries."""
+    cache[key] = value
+    while len(cache) > keep:
+        del cache[next(iter(cache))]
 
 
 def _scroll(sel: int, top: int, h: int, n: int) -> int:
@@ -259,6 +298,15 @@ class App:
         self.overlay: str | None = None
         self.devices: list | None = None
         self.dev_sel = 0
+
+        # the lyrics view (v): lyrics and cover are fetched only while it is open, and kept
+        # for the last few songs in memory only
+        self.view = "list"                      # "list" | "now"
+        self.lyrics: dict = {}                  # track uri -> api.Lyrics
+        self.arts: dict = {}                    # (cover url, cols, rows) -> lines
+        self.extra_wait: dict = {}              # request key -> no retry before (inf: in flight)
+        self.lyr_err: tuple = ("", "")          # (track uri, why its lyrics didn't load)
+        self.lyr_top: int | None = None         # scrolled by hand; None follows the song
 
         self.status = ""
         self.status_warn = False
@@ -510,7 +558,9 @@ class App:
         if kind == "track":
             if not (pb.track and pb.track.uri == uri):   # same track: keep it, nothing to redraw
                 pb.track = Track(uri, text("name") or "Unknown", text("artists"), text("album"),
-                                 num("duration_ms"), 0)
+                                 num("duration_ms"), 0, cover=text("cover"))
+            elif text("cover"):
+                pb.track.cover = text("cover")
             pb.progress_ms, pb.fetched_at = 0, now
             self.track_changed(pb.track)
         elif kind in ("playing", "paused", "loading", "pos"):
@@ -598,6 +648,7 @@ class App:
         old = self.pb.track if self.pb else None
         if pb and pb.track and old and old.uri == pb.track.uri and old.name == pb.track.name \
                 and old.duration_ms == pb.track.duration_ms:
+            old.cover = old.cover or pb.track.cover
             pb.track = old      # the same object: the player rows aren't redrawn for nothing
         self.pb = pb
         track = pb.track if pb else None
@@ -1034,6 +1085,80 @@ class App:
         self.command(lambda: self.api.transfer(d.id, play),
                      f"{'Playing' if play else 'Switched'} on {d.name}")
 
+    # ── Lyrics view ──────────────────────────────────────────────────────────
+    def toggle_view(self) -> None:
+        self.view = "list" if self.view == "now" else "now"
+        self.lyr_top = None
+        if self.view == "now":
+            self.focus = "list"
+
+    def fetch_extras(self, now: float) -> None:
+        """Ask for the playing song's lyrics and cover, only while the lyrics view shows them."""
+        t = self.pb.track if self.pb else None
+        if t is None:
+            return
+        uri = t.uri
+        if t.is_track and uri not in self.lyrics and now >= self.extra_wait.get(uri, 0.0):
+            self.extra_wait[uri] = float("inf")
+
+            def done(ly, uri=uri):
+                self.extra_wait.pop(uri, None)
+                _remember(self.lyrics, uri, ly, 8)
+
+            def fail(err, uri=uri):
+                self.extra_wait[uri] = time.monotonic() + 15.0
+                self.lyr_err = (uri, describe_error(err))
+
+            self.bg(self.data, lambda: self.api.lyrics(uri), done, fail)
+        key = self.art_key(t)
+        if key and key not in self.arts and now >= self.extra_wait.get(key, 0.0):
+            self.extra_wait[key] = float("inf")
+
+            def got(lines, key=key):
+                self.extra_wait.pop(key, None)
+                _remember(self.arts, key, lines, 2)
+
+            def no_art(err, key=key):
+                self.extra_wait[key] = time.monotonic() + 30.0    # the view just shows no cover
+
+            self.bg(self.data, lambda: self.api.art(*key), got, no_art)
+
+    def art_key(self, t: Track | None) -> tuple | None:
+        """What to ask for to draw this track's cover now: (url, cols, rows, colour pairs)."""
+        cols, rows = self.now_geo(self.layout())[:2]
+        if not (t and t.cover and cols):
+            return None
+        return t.cover, cols, rows, self.theme.art_pairs if self.g["half"] else 0
+
+    def now_geo(self, lay: Layout) -> tuple:
+        """The lyrics view's areas: (cover cols, cover rows, lyrics x, lyrics width, first row,
+        rows). A cover cell is two square pixels stacked, so cols = 2 x rows is square on
+        screen. It grows with the window up to 256x256 pixels (128 rows), leaves room for a
+        caption and is left out when the lyrics would get fewer than 30 columns."""
+        y0 = lay.top + (2 if self.H >= 20 else 1)
+        n = lay.top + lay.h - y0
+        rows = min(n - 3 if n >= 12 else n, lay.w // 5, (lay.w - 34) // 2, 128)
+        if rows < 6:
+            rows = 0
+        lx = lay.x0 + (rows * 2 + 4 if rows else 0)
+        return rows * 2, rows, lx, lay.x0 + lay.w - lx, y0, n
+
+    def lyric_line(self, now: float) -> tuple:
+        """(index of the line being sung or -1, ms until the next line or None)."""
+        pb = self.pb
+        ly = self.lyrics.get(pb.track.uri) if pb and pb.track else None
+        if not ly or not ly.times:
+            return -1, None
+        times, ms = ly.times, pb.progress(now)
+        lo, hi = 0, len(times)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if times[mid] <= ms:
+                lo = mid + 1
+            else:
+                hi = mid
+        return lo - 1, (times[lo] - ms if lo < len(times) else None)
+
     # ── Library ──────────────────────────────────────────────────────────────
     def _list(self, key: str) -> TrackList:
         tl = self.lists.get(key)
@@ -1079,7 +1204,7 @@ class App:
         tl = self._list(key)
         if tl.stale:
             tl.reset()
-        self.cur = tl
+        self.cur, self.view = tl, "list"
         if tl.kind != "search" or tl.query:
             self.load_more(tl)
 
@@ -1160,7 +1285,7 @@ class App:
         if self.cur.kind != "search":
             self.before_search = (self.cur, self.side_sel, self.focus)
         self.side_sel = next(i for i, it in enumerate(self.side) if it.key == "search")
-        self.cur = self._list("search")
+        self.cur, self.view = self._list("search"), "list"
         self.typing, self.focus = True, "list"
         self.query, self.qcur = self.cur.query, len(self.cur.query)
 
@@ -1189,6 +1314,9 @@ class App:
                     break
                 target = i
             self.side_sel = target
+        elif self.view == "now":
+            # Scroll the lyrics by hand; enter follows the song again.
+            self.lyr_top = max(0, min(self._lyr_max, self._lyr_shown + delta))
         else:
             tl = self.cur
             if tl.tracks:
@@ -1198,7 +1326,7 @@ class App:
 
     def jump(self, end: bool) -> None:
         tl = self.cur
-        if self.focus == "list":
+        if self.focus == "list" and self.view == "list":
             tl.want_end = end and tl.next_offset is not None
             tl.restore = None
         self.move(10**9 if end else -10**9)
@@ -1211,6 +1339,8 @@ class App:
             elif it.selectable:
                 self.open_list(it.key)
                 self.focus = "list"
+        elif self.view == "now":
+            self.lyr_top = None
         else:
             self.play_selected()
         self.dirty = True
@@ -1293,6 +1423,8 @@ class App:
             "R": self.cycle_repeat,
             "f": self.toggle_like,
             "d": self.open_devices,
+            "v": self.toggle_view,
+            ESC: lambda: self.view == "now" and self.toggle_view(),
             "r": self.refresh,
             "[": lambda: self.cycle_list(-1), "]": lambda: self.cycle_list(1),
             "\t": self.toggle_focus, curses.KEY_BTAB: self.toggle_focus,
@@ -1396,6 +1528,8 @@ class App:
         if self.status and now >= self.status_until:
             self.status = ""
             self.dirty = True
+        if self.view == "now" and not self.too_small:
+            self.fetch_extras(now)
         if self.engine:
             st = self.engine.status
             if st != self.engine_status:
@@ -1409,6 +1543,10 @@ class App:
         pb = self.pb
         if pb and pb.is_playing and pb.track:
             t = min(t, (1000 - pb.progress(now) % 1000) / 1000)
+            if self.view == "now":
+                nxt = self.lyric_line(now)[1]     # wake as the next line starts, not before
+                if nxt is not None:
+                    t = min(t, nxt / 1000)
         if self.status:
             t = min(t, self.status_until - now)
         if self.vol_deadline:
@@ -1456,6 +1594,14 @@ class App:
     _lay: tuple | None = None
     _cols_key: tuple | None = None
     _cols: Cols | None = None
+    _lyr_cur = -2           # lyric line last drawn as current (-2: none drawn yet)
+    _lyr_shown = 0          # first lyric row last shown, and the last row that can be first
+    _lyr_max = 0
+    _lyr_uri = ""
+    _wrap_key: tuple | None = None
+    _wrapped: tuple = ((), ())
+    _art_on = None          # the cover whose colour pairs are set up, and their attributes
+    _art_attrs: list = []
 
     def layout(self) -> Layout:
         H, W = self.H, self.W
@@ -1483,8 +1629,11 @@ class App:
         if self.dirty:
             drew = self.draw_all(now)
         elif pb and pb.track and pb.is_playing and not self.too_small and not self.overlay \
-                and pb.progress(now) // 1000 != self.last_sec:
+                and (pb.progress(now) // 1000 != self.last_sec
+                     or self.view == "now" and self.lyric_line(now)[0] != self._lyr_cur):
             drew = self.draw_progress(now)
+            if self.view == "now":
+                drew |= self.draw_now(self.layout(), now)
         else:
             return
         self.dirty = False
@@ -1498,7 +1647,7 @@ class App:
         s, T = self.scr, self.theme
         # The devices box resizes when the list arrives, so its row count is geometry too.
         ndev = len(self.devices or ()) if self.overlay == "devices" else 0
-        size = (self.H, self.W, self.too_small, self.overlay, ndev)
+        size = (self.H, self.W, self.too_small, self.overlay, ndev, self.view)
         fresh = size != self._size
         if fresh:
             self._size, self._drawn = size, {}
@@ -1515,7 +1664,7 @@ class App:
         lay = self.layout()
         drew = self.draw_header()
         drew |= self.draw_sidebar(lay)
-        drew |= self.draw_main(lay)
+        drew |= self.draw_now(lay, now) if self.view == "now" else self.draw_main(lay)
         drew |= self.draw_player(now, lay)
         if self.overlay:
             devs = tuple(self.devices) if self.devices is not None else None
@@ -1755,6 +1904,134 @@ class App:
                 put(s, y, x0 - 1, " " + fit(" " * ((w - width(text)) // 2) + text, w + 2), attr)
                 drew = True
         return drew
+
+    def draw_now(self, lay: Layout, now: float) -> bool:
+        """The lyrics view: the cover on the left, the lyrics on the right. The line being
+        sung is bright with a bar beside it and sits 2/5 of the way down; the others fade
+        with their distance from it."""
+        s, T, g = self.scr, self.theme, self.g
+        pb = self.pb
+        t = pb.track if pb else None
+        aw, ah, lx, lw, y0, n = self.now_geo(lay)
+        ly = self.lyrics.get(t.uri) if t else None
+        cur = self._lyr_cur = self.lyric_line(now)[0]
+        if (t.uri if t else "") != self._lyr_uri:
+            self._lyr_uri, self.lyr_top = (t.uri if t else ""), None   # a new song: follow it
+
+        info = "not synced" if ly and ly.lines and not ly.times else ""
+        drew = False
+        if self._changed(("main", lay.top), ("now", t.name if t else "", info)):
+            put(s, lay.top, lay.x0 - 1, " " * (lay.w + 3))
+            title = fit(t.name if t else "Lyrics", max(1, lay.w - len(info) - 2), g["ell"]).rstrip()
+            put(s, lay.top, lay.x0, title, T[TITLE])
+            if info:
+                put(s, lay.top, lay.x0 + lay.w - len(info), info, T[FAINT])
+            drew = True
+        if aw:
+            drew |= self.draw_cover(t, lay.x0, y0, aw, ah, n)
+
+        if not (ly and ly.lines):
+            msg, hint = self.lyrics_note(t, ly)
+            self._lyr_shown = self._lyr_max = 0
+            note = [(x, DIM) for x in _wrap(msg, lw)] + [(x, FAINT) for x in _wrap(hint, lw) if hint]
+            for r in range(n):
+                i = r - n * 2 // 5
+                text, role = note[i] if 0 <= i < len(note) else ("", TEXT)
+                if self._changed(("lyr", r), (text, role)):
+                    put(s, y0 + r, lx, fit(text, lw), T[role])
+                    drew = True
+            return drew
+
+        synced = bool(ly.times)
+        rows, first = self.wrapped(ly, lw - 2, n >= 14)
+        last = max(0, len(rows) - n)
+        if self.lyr_top is not None:
+            top = min(self.lyr_top, last)
+        else:
+            top = max(0, min(last, first[cur] - n * 2 // 5)) if cur >= 0 else 0
+        self._lyr_shown, self._lyr_max = top, last
+        for r in range(n):
+            line, text = rows[top + r] if top + r < len(rows) else (-1, "")
+            if not synced or line < 0:
+                role = TEXT
+            else:
+                d = line - cur
+                role = (TITLE if d == 0 else DIM if d == -1 else FAINT if d < 0
+                        else TEXT if d == 1 else DIM if d <= 3 else FAINT)
+            bar = synced and line == cur and line >= 0
+            if self._changed(("lyr", r), (text, role, bar)):
+                put(s, y0 + r, lx, g["mark"] if bar else " ", T[ACCENT])
+                put(s, y0 + r, lx + 1, " " + fit(text, lw - 2, g["ell"]), T[role])
+                drew = True
+        return drew
+
+    def draw_cover(self, t: Track | None, x: int, y0: int, aw: int, ah: int, n: int) -> bool:
+        """The cover, then its album and artists under it when there is room."""
+        s, T, drew = self.scr, self.theme, False
+        key = self.art_key(t)
+        art = self.arts.get(key) if key else None
+        attrs = None
+        if art and art.palette:
+            if self._art_on is not art:
+                self._art_on, self._art_attrs = art, self.theme.art(art.palette, art.pairs)
+                # Colour pair numbers are reused from cover to cover: make curses resend
+                # cells whose character and pair number happen to be the same as before.
+                try:
+                    s.redrawln(y0, ah)
+                except (AttributeError, curses.error):
+                    pass
+            attrs = self._art_attrs
+        half = self.g["half"]
+        for r in range(ah):
+            row = art.rows[r] if art and r < len(art.rows) else None
+            if not self._changed(("art", r), (art, r) if row else None):
+                continue
+            drew, y = True, y0 + r
+            if not row:
+                put(s, y, x, " " * aw)
+            elif attrs is None:
+                put(s, y, x, row, T[DIM])                      # a text cover
+            else:
+                cx = x
+                for i in range(0, len(row), 2):
+                    c, k = row[i], row[i + 1] + 1
+                    put(s, y, cx, half * k, attrs[c] if c < len(attrs) else 0)
+                    cx += k
+        if n >= ah + 3:
+            cap = (t.album, t.artists) if t else ("", "")
+            if self._changed("caption", (cap, aw)):
+                put(s, y0 + ah + 1, x, fit(cap[0], aw, self.g["ell"]), T[DIM])
+                put(s, y0 + ah + 2, x, fit(cap[1], aw, self.g["ell"]), T[FAINT])
+                drew = True
+        return drew
+
+    def wrapped(self, ly: api.Lyrics, w: int, spaced: bool) -> tuple:
+        """The lyrics as rows w wide: ([(line index or -1 for a gap, text), ...], each line's
+        first row). Spaced puts a blank row between lines; a synced line with no words is
+        an instrumental break, shown as a note."""
+        if self._wrap_key != (ly, w, spaced):
+            rows, first, note = [], [], self.g["note"]
+            for i, line in enumerate(ly.lines):
+                if spaced and i:
+                    rows.append((-1, ""))
+                first.append(len(rows))
+                parts = [note] if ly.times and not line.strip() else _wrap(line, w)
+                rows.extend((i, part) for part in parts)
+            self._wrap_key, self._wrapped = (ly, w, spaced), (rows, first)
+        return self._wrapped
+
+    def lyrics_note(self, t: Track | None, ly) -> tuple:
+        """What the lyrics side says when there are no lyrics to show: (message, hint)."""
+        if t is None:
+            return "Nothing playing", "pick a song and press enter"
+        if not t.is_track:
+            return "Only songs have lyrics", ""
+        if ly is not None:
+            return "No lyrics for this song", ""
+        uri, why = self.lyr_err
+        if uri == t.uri and self.extra_wait.get(uri) != float("inf"):
+            return why[:1].upper() + why[1:], "trying again shortly"
+        return "Loading lyrics" + self.g["ell"], ""
 
     def draw_player(self, now: float, lay: Layout) -> bool:
         s, T, g, W = self.scr, self.theme, self.g, self.W

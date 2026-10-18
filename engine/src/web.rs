@@ -11,12 +11,15 @@ use serde_json::{json, Map, Value};
 use tokio::sync::Mutex;
 
 const API: &str = "https://api.spotify.com/";
+/// Spotify's image CDN: the only other host a request may go to, and only for a cover.
+const IMAGES: &str = "https://i.scdn.co/image/";
+const MAX_IMAGE: usize = 1 << 20;
 const TOKEN_URL: &str = "https://accounts.spotify.com/api/token";
 const TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_BODY: usize = 16 << 20;
 const REFRESH_MARGIN: f64 = 60.0;
 const MAX_WAIT_429: u64 = 5;
-const MALFORMED: &str = "Spotify sent a malformed response";
+pub const MALFORMED: &str = "Spotify sent a malformed response";
 
 /// The token file, in the format SpoTerm's login writes.
 #[derive(Clone, Serialize, Deserialize)]
@@ -241,6 +244,19 @@ impl Web {
             return Ok((status, value));
         }
     }
+
+    /// A cover image from Spotify's CDN (public, so no token goes with it).
+    pub async fn image(&self, url: &str) -> Result<Vec<u8>, Failure> {
+        if !url.starts_with(IMAGES) || url.len() > 128 {
+            return Err(Failure::net("refusing a link to another host"));
+        }
+        let resp = self.http.get(url).send().await.map_err(net_failure)?;
+        let status = resp.status().as_u16();
+        if status != 200 {
+            return Err(Failure { status, msg: format!("cover image ({status})"), body: Value::Null, retry_after: 0 });
+        }
+        read_body(resp, MAX_IMAGE).await
+    }
 }
 
 fn login_needed(msg: &str) -> Failure {
@@ -257,18 +273,24 @@ fn net_failure(e: reqwest::Error) -> Failure {
     })
 }
 
-/// The body as JSON (empty is null), refusing anything over MAX_BODY.
-async fn read_json(mut resp: reqwest::Response) -> Result<Value, Failure> {
-    if resp.content_length().is_some_and(|n| n as usize > MAX_BODY) {
+/// The body, refusing anything over `cap` bytes.
+async fn read_body(mut resp: reqwest::Response, cap: usize) -> Result<Vec<u8>, Failure> {
+    if resp.content_length().is_some_and(|n| n as usize > cap) {
         return Err(Failure::net("response too large"));
     }
     let mut buf = Vec::new();
     while let Some(chunk) = resp.chunk().await.map_err(net_failure)? {
-        if buf.len() + chunk.len() > MAX_BODY {
+        if buf.len() + chunk.len() > cap {
             return Err(Failure::net("response too large"));
         }
         buf.extend_from_slice(&chunk);
     }
+    Ok(buf)
+}
+
+/// The body as JSON (empty is null), refusing anything over MAX_BODY.
+async fn read_json(resp: reqwest::Response) -> Result<Value, Failure> {
+    let buf = read_body(resp, MAX_BODY).await?;
     if buf.iter().all(u8::is_ascii_whitespace) {
         return Ok(Value::Null);
     }

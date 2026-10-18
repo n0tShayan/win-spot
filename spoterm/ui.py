@@ -7,6 +7,9 @@ from functools import lru_cache
 # Colour roles (pair ids)
 TEXT, DIM, FAINT, ACCENT, SEL, SEL_ACCENT, SEL_DIM, WARN, TITLE, MUTED, MARK = range(1, 12)
 
+# Cover art (see Theme.art): its colour pairs start here, its 24-bit colours at 256 + 32.
+ART_PAIR0, ART_COLOR0, ART_COLORS = 16, 256 + 32, 64
+
 # Palette for 256-colour terminals, and the exact colours used where 24-bit colour is safe.
 XTERM = {"text": 252, "dim": 246, "faint": 240, "accent": 41, "band": 236, "white": 255,
          "sel_dim": 249, "warn": 209, "muted": 65}
@@ -20,6 +23,8 @@ class Theme:
     def __init__(self):
         self.attr = {}
         self.truecolor = False
+        self.art_pairs = 0          # colour pairs free for cover art; 0: draw covers as text
+        self.art_rgb = False        # cover colours exact (24-bit), not the nearest of 256
 
     def init(self) -> None:
         try:
@@ -74,22 +79,55 @@ class Theme:
             except curses.error:
                 self.attr[pid] = 0
         self.attr[TITLE] |= curses.A_BOLD
+        if n >= 256:
+            self.art_pairs = max(0, min(curses.COLOR_PAIRS, 256) - ART_PAIR0)
+        self.art_rgb = self.truecolor and curses.COLORS >= ART_COLOR0 + ART_COLORS
+
+    def art(self, palette: list, pairs: list) -> list:
+        """Set up a cover's colours (exact where 24-bit colour is safe, else the nearest of
+        the 256) and one colour pair per (top, bottom) pixel pair; returns their attributes."""
+        try:
+            if self.art_rgb:
+                for i, c in enumerate(palette):
+                    curses.init_color(ART_COLOR0 + i, *((c >> sh & 255) * 1000 // 255 for sh in (16, 8, 0)))
+                ids = [ART_COLOR0 + i for i in range(len(palette))]
+            else:
+                ids = [_xterm(c) for c in palette]
+            out = []
+            for i, (top, bottom) in enumerate(pairs):
+                curses.init_pair(ART_PAIR0 + i, ids[top], ids[bottom])
+                out.append(curses.color_pair(ART_PAIR0 + i))
+            return out
+        except curses.error:
+            return []
 
     def __getitem__(self, pid: int) -> int:
         return self.attr.get(pid, 0)
+
+
+def _xterm(rgb: int) -> int:
+    """The nearest colour of the xterm 256: the 6x6x6 cube or the grey ramp."""
+    r, g, b = rgb >> 16, rgb >> 8 & 255, rgb & 255
+    lv = (0, 95, 135, 175, 215, 255)
+    q = [min(range(6), key=lambda i: abs(lv[i] - v)) for v in (r, g, b)]
+    cube = sum((lv[i] - v) ** 2 for i, v in zip(q, (r, g, b)))
+    gi = max(0, min(23, ((r + g + b) // 3 - 3) // 10))
+    gv = 8 + 10 * gi
+    grey = (r - gv) ** 2 + (g - gv) ** 2 + (b - gv) ** 2
+    return 16 + 36 * q[0] + 6 * q[1] + q[2] if cube <= grey else 232 + gi
 
 
 # Everything here renders single-width in Windows Terminal / Cascadia (no emoji presentation).
 UNICODE_GLYPHS = {
     "play": "▶", "pause": "‖", "heart": "♥", "bar_on": "━", "bar_off": "─",
     "rule": "─", "dot": "●", "ell": "…", "sep": " · ", "cursor": "›", "mark": "▌",
-    "thumb": "┃", "ramp": "▁▂▃▄▅▆▇█",
+    "thumb": "┃", "ramp": "▁▂▃▄▅▆▇█", "half": "▀", "note": "♪",
     "tl": "╭", "tr": "╮", "bl": "╰", "br": "╯", "h": "─", "v": "│",
 }
 ASCII_GLYPHS = {
     "play": ">", "pause": "=", "heart": "<3", "bar_on": "=", "bar_off": "-",
     "rule": "-", "dot": "*", "ell": "~", "sep": " - ", "cursor": ">", "mark": ">",
-    "thumb": "|", "ramp": "",
+    "thumb": "|", "ramp": "", "half": "", "note": "~",
     "tl": "+", "tr": "+", "bl": "+", "br": "+", "h": "-", "v": "|",
 }
 

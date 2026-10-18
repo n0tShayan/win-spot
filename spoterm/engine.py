@@ -3,7 +3,8 @@
 It does the two heavy jobs so this Python process stays tiny:
 
 * plays audio as the "SpoTerm" Spotify Connect device, and
-* makes every Web API call over its own HTTPS stack (so Python never loads TLS).
+* makes every Web API call over its own HTTPS stack (so Python never loads TLS), and
+  fetches lyrics and turns covers into ASCII art when the lyrics view asks.
 
 We write one JSON command per line to its stdin; it answers with one JSON event per
 line on stdout. A reader thread blocks on the pipe and costs nothing while idle:
@@ -221,6 +222,20 @@ class Engine:
 
     def call(self, method: str, path: str, query: dict | None = None, body=None):
         """A Web API call made by the engine. Blocks (on a worker thread) until it answers."""
+        ev = self._request({"cmd": "api", "method": method, "path": path,
+                            "query": query or None, "body": body},
+                           f"api {method} {path} {query or ''} {body or ''}")
+        if method != "GET" and ev.get("status") == 0 and ev.get("error") == MALFORMED:
+            # Player commands now answer 200 with a bare text id; engines built before that
+            # fix report it as malformed. The command worked.
+            return None
+        return self._body(ev)
+
+    def ask(self, cmd: str, **args):
+        """Another request the engine answers like an API call (lyrics, cover art). Blocks."""
+        return self._body(self._request({"cmd": cmd, **args}, cmd))
+
+    def _request(self, obj: dict, what: str) -> dict:
         from .api import ApiError
         if not self._wait_alive(10):
             raise ApiError(0, "SpoTerm's engine isn't running")
@@ -229,25 +244,25 @@ class Engine:
             cid = self._next_id
         slot = [threading.Event(), None]
         self._calls[cid] = slot
-        if not self._write({"cmd": "api", "id": cid, "method": method, "path": path,
-                            "query": query or None, "body": body}):
+        if not self._write({**obj, "id": cid}):
             self._calls.pop(cid, None)
             raise ApiError(0, "SpoTerm's engine isn't running")
         t0 = time.monotonic()
         if not slot[0].wait(CALL_TIMEOUT):
             self._calls.pop(cid, None)
             if config.DEBUG:
-                config.debug(f"api {method} {path} {query or ''} {body or ''} -> timeout")
+                config.debug(f"{what} -> timeout")
             raise TimeoutError()
         ev = slot[1]
-        status = ev.get("status") if isinstance(ev.get("status"), int) else 0
         if config.DEBUG:
-            config.debug(f"api {method} {path} {query or ''} {body or ''} -> {status} "
-                         f"{ev.get('error') or ''} {(time.monotonic() - t0) * 1000:.0f}ms")
-        if method != "GET" and status == 0 and ev.get("error") == MALFORMED:
-            # Player commands now answer 200 with a bare text id; engines built before that
-            # fix report it as malformed. The command worked.
-            return None
+            config.debug(f"{what} -> {ev.get('status')} {ev.get('error') or ''} "
+                         f"{(time.monotonic() - t0) * 1000:.0f}ms")
+        return ev
+
+    @staticmethod
+    def _body(ev: dict):
+        from .api import ApiError
+        status = ev.get("status") if isinstance(ev.get("status"), int) else 0
         if "error" in ev or status >= 400 or status <= 0:
             b = ev.get("body")
             ra = ev.get("retry_after")
